@@ -1,4 +1,4 @@
-name: Andrew TTS
+name: TTs 2
 
 on:
   workflow_dispatch:
