@@ -8,9 +8,6 @@ on:
         required: false
         default: ""
 
-  schedule:
-    - cron: '30 22 * * *'
-
 permissions:
   contents: write
 
@@ -198,4 +195,4 @@ jobs:
           rm -rf chunks/
           git add -A
           git diff --cached --quiet || git commit -m "Cleanup: chunks deleted after merge"
-          git push
+          git push hey it saves the chunks so can i run two different workflows at once
