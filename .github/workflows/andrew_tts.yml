@@ -22,13 +22,6 @@ jobs:
         with:
           token: ${{ secrets.PAT }}
 
-      - name: Checkout audio repo
-        uses: actions/checkout@v4
-        with:
-          repository: hanshu1202/andrew-tts-audio
-          token: ${{ secrets.PAT }}
-          path: audio_repo
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -46,20 +39,23 @@ jobs:
           elif [ -f "input.txt" ]; then
             echo "Using input.txt from repo."
           else
-            echo "ERROR: No input.txt found and no text provided."
+            echo "ERROR: No input.txt found."
             exit 1
           fi
 
       - name: Run TTS
         run: |
           python - <<'PYEOF'
-          import asyncio, edge_tts, time, os, glob, subprocess
+          import asyncio, edge_tts, time, os, glob, subprocess, requests
           from datetime import datetime
 
-          VOICE      = "en-US-AndrewMultilingualNeural"
-          CHUNK_SIZE = 5000
-          CHUNK_DIR  = "audio_repo/chunks"
-          SAVE_EVERY = 5
+          VOICE       = "en-US-AndrewMultilingualNeural"
+          CHUNK_SIZE  = 5000
+          CHUNK_DIR   = "/tmp/tts_chunks"   # local only, never pushed to any repo
+          BATCH_SIZE  = 5
+          BATCH_PAUSE = 3
+          PAT         = os.environ["PAT"]
+          REPO        = "hanshu1202/andrew-tts-audio"
           os.makedirs(CHUNK_DIR, exist_ok=True)
 
           with open("input.txt", "r", encoding="utf-8") as f:
@@ -80,22 +76,6 @@ jobs:
           else:
               print("Fresh run!")
 
-          async def git_push(done):
-              proc = await asyncio.create_subprocess_exec(
-                  "bash", "-c",
-                  f'cd audio_repo && '
-                  f'git config user.name "github-actions[bot]" && '
-                  f'git config user.email "github-actions[bot]@users.noreply.github.com" && '
-                  f'git pull --rebase origin main && '
-                  f'git add chunks/ && '
-                  f'git diff --cached --quiet || git commit -m "Progress: {done} chunks done" && '
-                  f'git push',
-                  stdout=asyncio.subprocess.PIPE,
-                  stderr=asyncio.subprocess.PIPE
-              )
-              await proc.communicate()
-              print(f"  [progress saved — {done} chunks]")
-
           async def process_chunk(idx, chunk):
               path = f"{CHUNK_DIR}/chunk_{str(idx).zfill(5)}.mp3"
               if os.path.exists(path):
@@ -114,10 +94,7 @@ jobs:
 
           async def main():
               batch_start = time.time()
-              done_count  = 0
               chunk_times = []
-              BATCH_SIZE  = 5
-              BATCH_PAUSE = 3
 
               for b in range(0, total, BATCH_SIZE):
                   batch   = [(i, all_chunks[i]) for i in range(b, min(b+BATCH_SIZE, total))]
@@ -133,20 +110,17 @@ jobs:
                   t       = time.time()
                   results = await asyncio.gather(*[process_chunk(idx, chunk) for idx, chunk in batch])
                   chunk_times.append((time.time() - t) / len(batch))
-                  done_count += sum(1 for r in results if r)
-
-                  await git_push(done_count)
 
                   if b + BATCH_SIZE < total:
                       await asyncio.sleep(BATCH_PAUSE)
 
-              # Merge
-              print(f"\nMerging {done_count} chunks...")
-              done_files   = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
-              timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
-              OUTPUT       = f"andrew_{timestamp}.mp3"
-              list_path    = f"{CHUNK_DIR}/filelist.txt"
-              merge_start  = time.time()
+              # Merge locally
+              done_files  = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
+              print(f"\nMerging {len(done_files)} chunks locally...")
+              timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+              OUTPUT      = f"/tmp/andrew_{timestamp}.mp3"
+              list_path   = f"{CHUNK_DIR}/filelist.txt"
+              merge_start = time.time()
 
               with open(list_path, "w") as f:
                   for p in done_files:
@@ -167,91 +141,52 @@ jobs:
               print(f"Merge DONE! Time: {elapsed//60}m {elapsed%60}s")
               print(f"File size: {size_mb:.1f} MB")
 
-              with open("output_filename.txt", "w") as f:
-                  f.write(OUTPUT)
+              # Upload directly to GitHub Releases
+              headers   = {
+                  "Authorization": f"token {PAT}",
+                  "Accept":        "application/vnd.github.v3+json"
+              }
+              tag       = f"tts-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+              timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-              os.remove(list_path)
+              print("\nCreating GitHub Release...")
+              resp = requests.post(
+                  f"https://api.github.com/repos/{REPO}/releases",
+                  headers=headers,
+                  json={
+                      "tag_name":   tag,
+                      "name":       f"TTS Output — {timestamp}",
+                      "body":       f"Auto-generated TTS audio.\nFile: {os.path.basename(OUTPUT)}",
+                      "draft":      False,
+                      "prerelease": False
+                  }
+              )
 
-              # Cleanup chunks
-              for p in done_files:
-                  try: os.remove(p)
-                  except: pass
-              print("Chunks deleted!")
+              if resp.status_code != 201:
+                  print(f"Failed to create release: {resp.status_code} {resp.text}")
+                  exit(1)
+
+              upload_url = resp.json()["upload_url"].replace("{?name,label}", "")
+              print(f"Uploading {size_mb:.1f} MB to Releases...")
+
+              with open(OUTPUT, "rb") as f:
+                  upload_resp = requests.post(
+                      f"{upload_url}?name={os.path.basename(OUTPUT)}",
+                      headers={
+                          "Authorization": f"token {PAT}",
+                          "Content-Type":  "audio/mpeg"
+                      },
+                      data=f,
+                      timeout=600
+                  )
+
+              if upload_resp.status_code == 201:
+                  print(f"\nDONE! Download: {upload_resp.json()['browser_download_url']}")
+              else:
+                  print(f"Upload failed: {upload_resp.status_code} {upload_resp.text}")
+                  exit(1)
 
           asyncio.run(main())
           PYEOF
-
-      - name: Upload MP3 to GitHub Releases
-        run: |
-          python - <<'PYEOF'
-          import requests, os
-          from datetime import datetime
-
-          PAT     = os.environ["PAT"]
-          REPO    = "hanshu1202/andrew-tts-audio"
-          HEADERS = {
-              "Authorization": f"token {PAT}",
-              "Accept":        "application/vnd.github.v3+json"
-          }
-
-          with open("output_filename.txt") as f:
-              OUTPUT = f.read().strip()
-
-          timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-          tag       = f"tts-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-
-          print("Creating GitHub Release...")
-          resp = requests.post(
-              f"https://api.github.com/repos/{REPO}/releases",
-              headers=HEADERS,
-              json={
-                  "tag_name":   tag,
-                  "name":       f"TTS Output — {timestamp}",
-                  "body":       f"Auto-generated TTS audio.\nFile: {OUTPUT}",
-                  "draft":      False,
-                  "prerelease": False
-              }
-          )
-
-          if resp.status_code != 201:
-              print(f"Failed to create release: {resp.status_code} {resp.text}")
-              exit(1)
-
-          release    = resp.json()
-          upload_url = release["upload_url"].replace("{?name,label}", "")
-          print(f"Release created: {release['html_url']}")
-
-          size_mb = os.path.getsize(OUTPUT) / 1024 / 1024
-          print(f"Uploading {OUTPUT} ({size_mb:.1f} MB)...")
-
-          with open(OUTPUT, "rb") as f:
-              upload_resp = requests.post(
-                  f"{upload_url}?name={OUTPUT}",
-                  headers={
-                      "Authorization": f"token {PAT}",
-                      "Content-Type":  "audio/mpeg"
-                  },
-                  data=f,
-                  timeout=600
-              )
-
-          if upload_resp.status_code == 201:
-              print(f"\nUPLOAD DONE!")
-              print(f"Download: {upload_resp.json()['browser_download_url']}")
-          else:
-              print(f"Upload failed: {upload_resp.status_code} {upload_resp.text}")
-              exit(1)
-          PYEOF
         env:
           PAT: ${{ secrets.PAT }}
-
-      - name: Cleanup chunks from audio repo
-        run: |
-          cd audio_repo
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main
-          rm -rf chunks/
-          git add -A
-          git diff --cached --quiet || git commit -m "Cleanup: chunks deleted after merge"
-          git push
