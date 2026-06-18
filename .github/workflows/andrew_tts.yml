@@ -36,7 +36,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install edge-tts -q
+          pip install edge-tts requests -q
           sudo apt-get install -y -q ffmpeg
 
       - name: Prepare input text
@@ -52,22 +52,25 @@ jobs:
 
       - name: Run TTS
         run: |
-          python - <<'EOF'
-          import asyncio, edge_tts, time, os, subprocess, glob
+          python - <<'PYEOF'
+          import asyncio, edge_tts, time, os, glob, subprocess
           from datetime import datetime
 
           VOICE      = "en-US-AndrewMultilingualNeural"
           CHUNK_SIZE = 5000
-          CHUNK_DIR  = "chunks"
-          SAVE_EVERY = 5        # commit progress to repo every 5 chunks
+          CHUNK_DIR  = "audio_repo/chunks"
+          SAVE_EVERY = 5
           os.makedirs(CHUNK_DIR, exist_ok=True)
 
           with open("input.txt", "r", encoding="utf-8") as f:
               text = f.read().strip()
 
+          all_chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
+          total      = len(all_chunks)
           print(f"Total characters: {len(text):,}")
+          print(f"Total chunks: {total}")
 
-          # ── Delete last chunk (may be corrupted from previous killed run) ──
+          # Delete last chunk (corruption protection)
           existing = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
           if existing:
               last = existing[-1]
@@ -75,124 +78,180 @@ jobs:
               print(f"Deleted last chunk (safety): {os.path.basename(last)}")
               print(f"Resuming from chunk {len(existing)-1}...")
           else:
-              print("Fresh run, no existing chunks.")
+              print("Fresh run!")
 
-          async def git_commit_progress(done_count):
+          async def git_push(done):
               proc = await asyncio.create_subprocess_exec(
                   "bash", "-c",
+                  f'cd audio_repo && '
                   f'git config user.name "github-actions[bot]" && '
                   f'git config user.email "github-actions[bot]@users.noreply.github.com" && '
+                  f'git pull --rebase origin main && '
                   f'git add chunks/ && '
-                  f'git diff --cached --quiet || git commit -m "Progress: {done_count} chunks done" && '
+                  f'git diff --cached --quiet || git commit -m "Progress: {done} chunks done" && '
                   f'git push',
                   stdout=asyncio.subprocess.PIPE,
                   stderr=asyncio.subprocess.PIPE
               )
               await proc.communicate()
-              print(f"  [saved progress to repo]")
+              print(f"  [progress saved — {done} chunks]")
+
+          async def process_chunk(idx, chunk):
+              path = f"{CHUNK_DIR}/chunk_{str(idx).zfill(5)}.mp3"
+              if os.path.exists(path):
+                  print(f"Chunk {idx+1}/{total} already done, skipping...")
+                  return path
+              for attempt in range(3):
+                  try:
+                      comm = edge_tts.Communicate(chunk, VOICE)
+                      await comm.save(path)
+                      return path
+                  except Exception as e:
+                      print(f"  Chunk {idx} attempt {attempt+1} failed: {e}")
+                      await asyncio.sleep(5)
+              print(f"  Chunk {idx} failed 3 times, skipping.")
+              return None
 
           async def main():
-              chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
-              total  = len(chunks)
-              print(f"Total chunks: {total}")
-
-              parts       = []
-              chunk_times = []
               batch_start = time.time()
+              done_count  = 0
+              chunk_times = []
+              BATCH_SIZE  = 5
+              BATCH_PAUSE = 3
 
-              for i, chunk in enumerate(chunks):
-                  path = f"{CHUNK_DIR}/chunk_{str(i).zfill(5)}.mp3"
-
-                  if os.path.exists(path):
-                      print(f"Chunk {i+1}/{total} already done, skipping...")
-                      parts.append(path)
-                      continue
+              for b in range(0, total, BATCH_SIZE):
+                  batch   = [(i, all_chunks[i]) for i in range(b, min(b+BATCH_SIZE, total))]
+                  elapsed = int(time.time() - batch_start)
 
                   if chunk_times:
-                      avg     = sum(chunk_times) / len(chunk_times)
-                      eta     = int(avg * (total - i))
-                      elapsed = int(time.time() - batch_start)
-                      print(f"Chunk {i+1}/{total}  ETA: {eta//60}m {eta%60}s  Elapsed: {elapsed//60}m {elapsed%60}s")
+                      avg = sum(chunk_times) / len(chunk_times)
+                      eta = int(avg * (total - b))
+                      print(f"Batch {b//BATCH_SIZE+1}  Chunk {b+1}/{total}  ETA: {eta//60}m {eta%60}s  Elapsed: {elapsed//60}m {elapsed%60}s")
                   else:
-                      print(f"Chunk {i+1}/{total}  ETA: calculating...")
+                      print(f"Batch {b//BATCH_SIZE+1}  Chunk {b+1}/{total}  ETA: calculating...")
 
-                  chunk_start = time.time()
-                  for attempt in range(3):
-                      try:
-                          comm = edge_tts.Communicate(chunk, VOICE)
-                          await comm.save(path)
-                          parts.append(path)
-                          break
-                      except Exception as e:
-                          print(f"  Attempt {attempt+1} failed: {e}")
-                          await asyncio.sleep(5)
-                  else:
-                      print(f"  Chunk {i+1} failed 3 times, skipping.")
-                      continue
+                  t       = time.time()
+                  results = await asyncio.gather(*[process_chunk(idx, chunk) for idx, chunk in batch])
+                  chunk_times.append((time.time() - t) / len(batch))
+                  done_count += sum(1 for r in results if r)
 
-                  chunk_times.append(time.time() - chunk_start)
+                  await git_push(done_count)
 
-                  # Save progress to repo every SAVE_EVERY chunks
-                  if (i + 1) % SAVE_EVERY == 0:
-                      await git_commit_progress(i + 1)
+                  if b + BATCH_SIZE < total:
+                      await asyncio.sleep(BATCH_PAUSE)
 
-              # ── Final commit of any remaining chunks ──
-              await git_commit_progress(len(parts))
-
-              # ── MERGE ──
-              print(f"\nMerging {len(parts)} chunks...")
-              merge_start  = time.time()
-              sorted_parts = sorted(parts)
+              # Merge
+              print(f"\nMerging {done_count} chunks...")
+              done_files   = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
+              timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
+              OUTPUT       = f"andrew_{timestamp}.mp3"
               list_path    = f"{CHUNK_DIR}/filelist.txt"
+              merge_start  = time.time()
 
               with open(list_path, "w") as f:
-                  for p in sorted_parts:
+                  for p in done_files:
                       f.write(f"file '{os.path.abspath(p)}'\n")
 
-              timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-              OUTPUT    = f"audio_repo/outputs/andrew_{timestamp}.mp3"
-              os.makedirs("audio_repo/outputs", exist_ok=True)
-
-              cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                     "-i", list_path, "-c", "copy", OUTPUT]
-
-              process = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True)
+              process = subprocess.Popen(
+                  ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", OUTPUT],
+                  stderr=subprocess.PIPE, text=True
+              )
               process.wait()
 
               if process.returncode != 0:
-                  print("ffmpeg merge failed!")
-                  return
+                  print("Merge failed!")
+                  exit(1)
 
-              total_time = int(time.time() - batch_start)
-              print(f"\nDONE! Time: {total_time//60}m {total_time%60}s")
-              print(f"Saved to audio repo: {OUTPUT}")
+              size_mb = os.path.getsize(OUTPUT) / 1024 / 1024
+              elapsed = int(time.time() - merge_start)
+              print(f"Merge DONE! Time: {elapsed//60}m {elapsed%60}s")
+              print(f"File size: {size_mb:.1f} MB")
 
-              # ── Cleanup chunks from engine repo ──
-              for p in sorted_parts:
+              with open("output_filename.txt", "w") as f:
+                  f.write(OUTPUT)
+
+              os.remove(list_path)
+
+              # Cleanup chunks
+              for p in done_files:
                   try: os.remove(p)
                   except: pass
-              try: os.remove(list_path)
-              except: pass
-              print("Chunks deleted. All clean!")
+              print("Chunks deleted!")
 
           asyncio.run(main())
-          EOF
+          PYEOF
 
-      - name: Push MP3 to audio repo
+      - name: Upload MP3 to GitHub Releases
+        run: |
+          python - <<'PYEOF'
+          import requests, os
+          from datetime import datetime
+
+          PAT     = os.environ["PAT"]
+          REPO    = "hanshu1202/andrew-tts-audio"
+          HEADERS = {
+              "Authorization": f"token {PAT}",
+              "Accept":        "application/vnd.github.v3+json"
+          }
+
+          with open("output_filename.txt") as f:
+              OUTPUT = f.read().strip()
+
+          timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+          tag       = f"tts-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+          print("Creating GitHub Release...")
+          resp = requests.post(
+              f"https://api.github.com/repos/{REPO}/releases",
+              headers=HEADERS,
+              json={
+                  "tag_name":   tag,
+                  "name":       f"TTS Output — {timestamp}",
+                  "body":       f"Auto-generated TTS audio.\nFile: {OUTPUT}",
+                  "draft":      False,
+                  "prerelease": False
+              }
+          )
+
+          if resp.status_code != 201:
+              print(f"Failed to create release: {resp.status_code} {resp.text}")
+              exit(1)
+
+          release    = resp.json()
+          upload_url = release["upload_url"].replace("{?name,label}", "")
+          print(f"Release created: {release['html_url']}")
+
+          size_mb = os.path.getsize(OUTPUT) / 1024 / 1024
+          print(f"Uploading {OUTPUT} ({size_mb:.1f} MB)...")
+
+          with open(OUTPUT, "rb") as f:
+              upload_resp = requests.post(
+                  f"{upload_url}?name={OUTPUT}",
+                  headers={
+                      "Authorization": f"token {PAT}",
+                      "Content-Type":  "audio/mpeg"
+                  },
+                  data=f,
+                  timeout=600
+              )
+
+          if upload_resp.status_code == 201:
+              print(f"\nUPLOAD DONE!")
+              print(f"Download: {upload_resp.json()['browser_download_url']}")
+          else:
+              print(f"Upload failed: {upload_resp.status_code} {upload_resp.text}")
+              exit(1)
+          PYEOF
+        env:
+          PAT: ${{ secrets.PAT }}
+
+      - name: Cleanup chunks from audio repo
         run: |
           cd audio_repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add outputs/
-          git commit -m "TTS output: $(ls outputs/*.mp3 | tail -1 | xargs basename)"
-          git push
-
-      - name: Cleanup chunks from engine repo
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git rm -r --cached chunks/ 2>/dev/null || true
+          git pull --rebase origin main
           rm -rf chunks/
           git add -A
           git diff --cached --quiet || git commit -m "Cleanup: chunks deleted after merge"
-          git push hey it saves the chunks so can i run two different workflows at once
+          git push
