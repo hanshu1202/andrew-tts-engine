@@ -7,7 +7,7 @@ on:
         description: "Paste text here (or leave blank to use input.txt from repo)"
         required: false
         default: ""
- schedule:
+  schedule:
     - cron: '30 22 * * *'
 
 permissions:
@@ -53,7 +53,7 @@ jobs:
 
           VOICE       = "en-US-AndrewMultilingualNeural"
           CHUNK_SIZE  = 5000
-          CHUNK_DIR   = "/tmp/tts_chunks"   # local only, never pushed to any repo
+          CHUNK_DIR   = "/tmp/tts_chunks"
           BATCH_SIZE  = 5
           BATCH_PAUSE = 3
           PAT         = os.environ["PAT"]
@@ -68,7 +68,6 @@ jobs:
           print(f"Total characters: {len(text):,}")
           print(f"Total chunks: {total}")
 
-          # Delete last chunk (corruption protection)
           existing = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
           if existing:
               last = existing[-1]
@@ -116,7 +115,6 @@ jobs:
                   if b + BATCH_SIZE < total:
                       await asyncio.sleep(BATCH_PAUSE)
 
-              # Merge locally
               done_files  = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
               print(f"\nMerging {len(done_files)} chunks locally...")
               timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -143,7 +141,6 @@ jobs:
               print(f"Merge DONE! Time: {elapsed//60}m {elapsed%60}s")
               print(f"File size: {size_mb:.1f} MB")
 
-              # Upload directly to GitHub Releases
               headers   = {
                   "Authorization": f"token {PAT}",
                   "Accept":        "application/vnd.github.v3+json"
