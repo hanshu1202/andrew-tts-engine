@@ -7,7 +7,7 @@ on:
         description: "Paste text here (or leave blank to use input.txt from repo)"
         required: false
         default: ""
-  
+
 permissions:
   contents: write
 
@@ -66,36 +66,40 @@ jobs:
           print(f"Total characters: {len(text):,}")
           print(f"Total chunks: {total}")
 
+          # Delete last chunk (corruption protection)
           existing = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
           if existing:
               last = existing[-1]
               os.remove(last)
               print(f"Deleted last chunk (safety): {os.path.basename(last)}")
-              print(f"Resuming from chunk {len(existing)-1}...")
+              start_idx = len(existing) - 1
+              print(f"Resuming from chunk {start_idx+1}...")
           else:
+              start_idx = 0
               print("Fresh run!")
 
           async def process_chunk(idx, chunk):
               path = f"{CHUNK_DIR}/chunk_{str(idx).zfill(5)}.mp3"
               if os.path.exists(path):
-                  print(f"Chunk {idx+1}/{total} already done, skipping...")
+                  print(f"  chunk {idx+1}/{total} already done, skipping...")
                   return path
               for attempt in range(3):
                   try:
                       comm = edge_tts.Communicate(chunk, VOICE)
                       await comm.save(path)
+                      print(f"  ✓ chunk {idx+1}/{total} done")
                       return path
                   except Exception as e:
-                      print(f"  Chunk {idx} attempt {attempt+1} failed: {e}")
+                      print(f"  chunk {idx+1} attempt {attempt+1} failed: {e}")
                       await asyncio.sleep(5)
-              print(f"  Chunk {idx} failed 3 times, skipping.")
+              print(f"  chunk {idx+1} failed 3 times, skipping.")
               return None
 
           async def main():
               batch_start = time.time()
               chunk_times = []
 
-              for b in range(0, total, BATCH_SIZE):
+              for b in range(start_idx, total, BATCH_SIZE):
                   batch   = [(i, all_chunks[i]) for i in range(b, min(b+BATCH_SIZE, total))]
                   elapsed = int(time.time() - batch_start)
 
@@ -113,6 +117,7 @@ jobs:
                   if b + BATCH_SIZE < total:
                       await asyncio.sleep(BATCH_PAUSE)
 
+              # Merge locally
               done_files  = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
               print(f"\nMerging {len(done_files)} chunks locally...")
               timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -139,7 +144,8 @@ jobs:
               print(f"Merge DONE! Time: {elapsed//60}m {elapsed%60}s")
               print(f"File size: {size_mb:.1f} MB")
 
-              headers   = {
+              # Upload to GitHub Releases
+              headers = {
                   "Authorization": f"token {PAT}",
                   "Accept":        "application/vnd.github.v3+json"
               }
