@@ -44,152 +44,231 @@ jobs:
           fi
 
       - name: Run TTS
+        env:
+          PAT: ${{ secrets.PAT }}
         run: |
           python - <<'PYEOF'
-          import asyncio, edge_tts, time, os, glob, subprocess, requests
+          import asyncio
+          import edge_tts
+          import time
+          import os
+          import glob
+          import subprocess
+          import requests
           from datetime import datetime
 
           VOICE       = "en-US-AndrewMultilingualNeural"
           CHUNK_SIZE  = 5000
-          CHUNK_DIR   = "/tmp/tts_chunks"
+          CHUNK_DIR   = "chunks"
           BATCH_SIZE  = 5
           BATCH_PAUSE = 3
-          PAT         = os.environ["PAT"]
-          REPO        = "hanshu1202/andrew-tts-audio"
+
+          PAT = os.environ["PAT"]
+          REPO = "hanshu1202/andrew-tts-audio"
+
           os.makedirs(CHUNK_DIR, exist_ok=True)
 
           with open("input.txt", "r", encoding="utf-8") as f:
               text = f.read().strip()
 
-          all_chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
-          total      = len(all_chunks)
+          all_chunks = [
+              text[i:i+CHUNK_SIZE]
+              for i in range(0, len(text), CHUNK_SIZE)
+          ]
+
+          total = len(all_chunks)
+
           print(f"Total characters: {len(text):,}")
           print(f"Total chunks: {total}")
 
-          # Delete last chunk (corruption protection)
           existing = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
+
           if existing:
               last = existing[-1]
               os.remove(last)
               print(f"Deleted last chunk (safety): {os.path.basename(last)}")
               start_idx = len(existing) - 1
-              print(f"Resuming from chunk {start_idx+1}...")
+              print(f"Resuming from chunk {start_idx + 1}")
           else:
               start_idx = 0
               print("Fresh run!")
 
+          async def git_push(done):
+              proc = await asyncio.create_subprocess_exec(
+                  "bash",
+                  "-c",
+                  f'''
+                  git config user.name "github-actions[bot]" &&
+                  git config user.email "github-actions[bot]@users.noreply.github.com" &&
+                  git pull --rebase origin main &&
+                  git add chunks/ &&
+                  git diff --cached --quiet || git commit -m "Progress: {done} chunks done" &&
+                  git push
+                  ''',
+                  stdout=asyncio.subprocess.PIPE,
+                  stderr=asyncio.subprocess.PIPE
+              )
+
+              await proc.communicate()
+              print(f"[progress saved — {done} chunks]")
+
           async def process_chunk(idx, chunk):
-              path = f"{CHUNK_DIR}/chunk_{str(idx).zfill(5)}.mp3"
+              path = f"{CHUNK_DIR}/chunk_{idx:05d}.mp3"
+
               if os.path.exists(path):
-                  print(f"  chunk {idx+1}/{total} already done, skipping...")
+                  print(f"chunk {idx+1}/{total} already done")
                   return path
+
               for attempt in range(3):
                   try:
                       comm = edge_tts.Communicate(chunk, VOICE)
                       await comm.save(path)
-                      print(f"  ✓ chunk {idx+1}/{total} done")
+                      print(f"✓ chunk {idx+1}/{total}")
                       return path
                   except Exception as e:
-                      print(f"  chunk {idx+1} attempt {attempt+1} failed: {e}")
+                      print(
+                          f"chunk {idx+1} attempt {attempt+1} failed: {e}"
+                      )
                       await asyncio.sleep(5)
-              print(f"  chunk {idx+1} failed 3 times, skipping.")
+
               return None
 
           async def main():
               batch_start = time.time()
               chunk_times = []
+              done_count = 0
 
               for b in range(start_idx, total, BATCH_SIZE):
-                  batch   = [(i, all_chunks[i]) for i in range(b, min(b+BATCH_SIZE, total))]
-                  elapsed = int(time.time() - batch_start)
+
+                  batch = [
+                      (i, all_chunks[i])
+                      for i in range(
+                          b,
+                          min(b + BATCH_SIZE, total)
+                      )
+                  ]
 
                   if chunk_times:
                       avg = sum(chunk_times) / len(chunk_times)
                       eta = int(avg * (total - b))
-                      print(f"Batch {b//BATCH_SIZE+1}  Chunk {b+1}/{total}  ETA: {eta//60}m {eta%60}s  Elapsed: {elapsed//60}m {elapsed%60}s")
-                  else:
-                      print(f"Batch {b//BATCH_SIZE+1}  Chunk {b+1}/{total}  ETA: calculating...")
+                      print(
+                          f"Chunk {b+1}/{total} "
+                          f"ETA {eta//60}m {eta%60}s"
+                      )
 
-                  t       = time.time()
-                  results = await asyncio.gather(*[process_chunk(idx, chunk) for idx, chunk in batch])
-                  chunk_times.append((time.time() - t) / len(batch))
+                  t = time.time()
+
+                  results = await asyncio.gather(
+                      *[
+                          process_chunk(idx, chunk)
+                          for idx, chunk in batch
+                      ]
+                  )
+
+                  chunk_times.append(
+                      (time.time() - t) / len(batch)
+                  )
+
+                  done_count += sum(
+                      1 for r in results if r
+                  )
+
+                  await git_push(done_count)
 
                   if b + BATCH_SIZE < total:
                       await asyncio.sleep(BATCH_PAUSE)
 
-              # Merge locally
-              done_files  = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
-              print(f"\nMerging {len(done_files)} chunks locally...")
-              timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-              OUTPUT      = f"/tmp/andrew_{timestamp}.mp3"
-              list_path   = f"{CHUNK_DIR}/filelist.txt"
-              merge_start = time.time()
-
-              with open(list_path, "w") as f:
-                  for p in done_files:
-                      f.write(f"file '{os.path.abspath(p)}'\n")
-
-              process = subprocess.Popen(
-                  ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", OUTPUT],
-                  stderr=subprocess.PIPE, text=True
+              done_files = sorted(
+                  glob.glob(f"{CHUNK_DIR}/chunk_*.mp3")
               )
-              process.wait()
 
-              if process.returncode != 0:
-                  print("Merge failed!")
-                  exit(1)
+              timestamp = datetime.now().strftime(
+                  "%Y%m%d_%H%M%S"
+              )
 
-              size_mb = os.path.getsize(OUTPUT) / 1024 / 1024
-              elapsed = int(time.time() - merge_start)
-              print(f"Merge DONE! Time: {elapsed//60}m {elapsed%60}s")
-              print(f"File size: {size_mb:.1f} MB")
+              output_file = f"/tmp/andrew_{timestamp}.mp3"
 
-              # Upload to GitHub Releases
+              filelist = f"{CHUNK_DIR}/filelist.txt"
+
+              with open(filelist, "w") as f:
+                  for p in done_files:
+                      f.write(
+                          f"file '{os.path.abspath(p)}'\n"
+                      )
+
+              subprocess.run(
+                  [
+                      "ffmpeg",
+                      "-y",
+                      "-f",
+                      "concat",
+                      "-safe",
+                      "0",
+                      "-i",
+                      filelist,
+                      "-c",
+                      "copy",
+                      output_file
+                  ],
+                  check=True
+              )
+
+              size_mb = (
+                  os.path.getsize(output_file)
+                  / 1024
+                  / 1024
+              )
+
+              print(
+                  f"Merge complete. Size: {size_mb:.1f} MB"
+              )
+
               headers = {
                   "Authorization": f"token {PAT}",
-                  "Accept":        "application/vnd.github.v3+json"
+                  "Accept":
+                  "application/vnd.github.v3+json"
               }
-              tag       = f"tts-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-              timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-              print("\nCreating GitHub Release...")
-              resp = requests.post(
+              tag = (
+                  f"tts-"
+                  f"{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+              )
+
+              release = requests.post(
                   f"https://api.github.com/repos/{REPO}/releases",
                   headers=headers,
                   json={
-                      "tag_name":   tag,
-                      "name":       f"TTS Output — {timestamp}",
-                      "body":       f"Auto-generated TTS audio.\nFile: {os.path.basename(OUTPUT)}",
-                      "draft":      False,
+                      "tag_name": tag,
+                      "name": tag,
+                      "draft": False,
                       "prerelease": False
                   }
               )
 
-              if resp.status_code != 201:
-                  print(f"Failed to create release: {resp.status_code} {resp.text}")
-                  exit(1)
+              release.raise_for_status()
 
-              upload_url = resp.json()["upload_url"].replace("{?name,label}", "")
-              print(f"Uploading {size_mb:.1f} MB to Releases...")
+              upload_url = (
+                  release.json()["upload_url"]
+                  .replace("{?name,label}", "")
+              )
 
-              with open(OUTPUT, "rb") as f:
-                  upload_resp = requests.post(
-                      f"{upload_url}?name={os.path.basename(OUTPUT)}",
+              with open(output_file, "rb") as f:
+                  upload = requests.post(
+                      f"{upload_url}?name={os.path.basename(output_file)}",
                       headers={
-                          "Authorization": f"token {PAT}",
-                          "Content-Type":  "audio/mpeg"
+                          "Authorization":
+                          f"token {PAT}",
+                          "Content-Type":
+                          "audio/mpeg"
                       },
-                      data=f,
-                      timeout=600
+                      data=f
                   )
 
-              if upload_resp.status_code == 201:
-                  print(f"\nDONE! Download: {upload_resp.json()['browser_download_url']}")
-              else:
-                  print(f"Upload failed: {upload_resp.status_code} {upload_resp.text}")
-                  exit(1)
+              upload.raise_for_status()
+
+              print(
+                  upload.json()["browser_download_url"]
+              )
 
           asyncio.run(main())
           PYEOF
-        env:
-          PAT: ${{ secrets.PAT }}
