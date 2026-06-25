@@ -46,7 +46,7 @@ jobs:
       - name: Run TTS
         run: |
           python - <<'PYEOF'
-          import asyncio, edge_tts, time, os, glob, subprocess, requests
+          import asyncio, edge_tts, time, os, glob, subprocess, requests, sys
           from datetime import datetime
 
           VOICE       = "en-US-AndrewMultilingualNeural"
@@ -63,27 +63,32 @@ jobs:
 
           all_chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
           total      = len(all_chunks)
-          print(f"Total characters: {len(text):,}")
-          print(f"Total chunks: {total}")
+          print(f"📊 Total characters: {len(text):,}")
+          print(f"📊 Total chunks: {total}")
+          print(f"🎯 Chunk size: {CHUNK_SIZE} chars | Batch size: {BATCH_SIZE}")
+          sys.stdout.flush()
 
           # Delete last chunk (corruption protection)
           existing = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
           if existing:
               last = existing[-1]
               os.remove(last)
-              print(f"Deleted last chunk (safety): {os.path.basename(last)}")
+              print(f"⚠️  Deleted last chunk (safety): {os.path.basename(last)}")
               start_idx = len(existing) - 1
-              print(f"Resuming from chunk {start_idx+1}...")
+              print(f"▶️  Resuming from chunk {start_idx+1}...")
+              sys.stdout.flush()
           else:
               start_idx = 0
-              print("Fresh run!")
+              print("✨ Fresh run!")
+              sys.stdout.flush()
 
           async def git_push(done):
+              print(f"  💾 Saving progress to git ({done} chunks done)...", end=" ", flush=True)
               proc = await asyncio.create_subprocess_exec(
                   "bash", "-c",
                   f'git config user.name "github-actions[bot]" && '
                   f'git config user.email "github-actions[bot]@users.noreply.github.com" && '
-                  f'git pull --rebase origin main && '
+                  f'git pull --rebase origin main 2>&1 | grep -v "Already up to date" || true && '
                   f'git add chunks/ && '
                   f'git diff --cached --quiet || git commit -m "Progress: {done} chunks done" && '
                   f'git push',
@@ -91,23 +96,27 @@ jobs:
                   stderr=asyncio.subprocess.PIPE
               )
               await proc.communicate()
-              print(f"  [progress saved — {done} chunks]")
+              print("✅ synced!")
+              sys.stdout.flush()
 
           async def process_chunk(idx, chunk):
               path = f"{CHUNK_DIR}/chunk_{str(idx).zfill(5)}.mp3"
               if os.path.exists(path):
-                  print(f"  chunk {idx+1}/{total} already done, skipping...")
+                  print(f"    ⏭️  chunk {idx+1}/{total} already exists, skipping", flush=True)
                   return path
               for attempt in range(3):
                   try:
+                      print(f"    🔄 chunk {idx+1}/{total} (attempt {attempt+1})...", end=" ", flush=True)
                       comm = edge_tts.Communicate(chunk, VOICE)
                       await comm.save(path)
-                      print(f"  ✓ chunk {idx+1}/{total} done")
+                      print(f"✓ done!", flush=True)
                       return path
                   except Exception as e:
-                      print(f"  chunk {idx+1} attempt {attempt+1} failed: {e}")
-                      await asyncio.sleep(5)
-              print(f"  chunk {idx+1} failed 3 times, skipping.")
+                      print(f"❌ failed: {str(e)[:50]}", flush=True)
+                      if attempt < 2:
+                          print(f"    ⏳ retrying in 5s...", flush=True)
+                          await asyncio.sleep(5)
+              print(f"    ⛔ chunk {idx+1} failed all 3 attempts, skipping.", flush=True)
               return None
 
           async def main():
@@ -118,28 +127,38 @@ jobs:
               for b in range(start_idx, total, BATCH_SIZE):
                   batch   = [(i, all_chunks[i]) for i in range(b, min(b+BATCH_SIZE, total))]
                   elapsed = int(time.time() - batch_start)
+                  percent = int((b / total) * 100)
 
                   if chunk_times:
                       avg = sum(chunk_times) / len(chunk_times)
                       eta = int(avg * (total - b))
-                      print(f"Batch {b//BATCH_SIZE+1}  Chunk {b+1}/{total}  ETA: {eta//60}m {eta%60}s  Elapsed: {elapsed//60}m {elapsed%60}s")
+                      eta_str = f"{eta//60}m {eta%60}s"
                   else:
-                      print(f"Batch {b//BATCH_SIZE+1}  Chunk {b+1}/{total}  ETA: calculating...")
+                      eta_str = "calculating..."
+
+                  elapsed_str = f"{elapsed//60}m {elapsed%60}s"
+                  print(f"\n📦 Batch {b//BATCH_SIZE+1} | Chunk {b+1}/{total} ({percent}%) | ETA: {eta_str} | Elapsed: {elapsed_str}")
+                  sys.stdout.flush()
 
                   t       = time.time()
                   results = await asyncio.gather(*[process_chunk(idx, chunk) for idx, chunk in batch])
                   chunk_times.append((time.time() - t) / len(batch))
                   done_count += sum(1 for r in results if r)
 
+                  print(f"  ✨ Batch complete! ({done_count}/{total} chunks done total)")
+                  sys.stdout.flush()
+
                   # Save progress to engine repo every batch
                   await git_push(done_count)
 
                   if b + BATCH_SIZE < total:
+                      print(f"  ⏸️  Pausing {BATCH_PAUSE}s before next batch...", flush=True)
                       await asyncio.sleep(BATCH_PAUSE)
 
               # Merge locally
               done_files  = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
-              print(f"\nMerging {len(done_files)} chunks locally...")
+              print(f"\n🎬 Merging {len(done_files)} chunks locally...")
+              sys.stdout.flush()
               timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
               OUTPUT      = f"/tmp/andrew_{timestamp}.mp3"
               list_path   = f"{CHUNK_DIR}/filelist.txt"
@@ -156,13 +175,14 @@ jobs:
               process.wait()
 
               if process.returncode != 0:
-                  print("Merge failed!")
+                  print("❌ Merge failed!")
+                  sys.stdout.flush()
                   exit(1)
 
               size_mb = os.path.getsize(OUTPUT) / 1024 / 1024
               elapsed = int(time.time() - merge_start)
-              print(f"Merge DONE! Time: {elapsed//60}m {elapsed%60}s")
-              print(f"File size: {size_mb:.1f} MB")
+              print(f"✅ Merge DONE! Time: {elapsed//60}m {elapsed%60}s | Size: {size_mb:.1f} MB")
+              sys.stdout.flush()
 
               # Upload to GitHub Releases
               headers = {
@@ -172,7 +192,7 @@ jobs:
               tag       = f"tts-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
               timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-              print("\nCreating GitHub Release...")
+              print("\n📤 Creating GitHub Release...", flush=True)
               resp = requests.post(
                   f"https://api.github.com/repos/{REPO}/releases",
                   headers=headers,
@@ -186,11 +206,12 @@ jobs:
               )
 
               if resp.status_code != 201:
-                  print(f"Failed to create release: {resp.status_code} {resp.text}")
+                  print(f"❌ Failed to create release: {resp.status_code} {resp.text}")
+                  sys.stdout.flush()
                   exit(1)
 
               upload_url = resp.json()["upload_url"].replace("{?name,label}", "")
-              print(f"Uploading {size_mb:.1f} MB to Releases...")
+              print(f"📡 Uploading {size_mb:.1f} MB to Releases...", flush=True)
 
               with open(OUTPUT, "rb") as f:
                   upload_resp = requests.post(
@@ -204,17 +225,20 @@ jobs:
                   )
 
               if upload_resp.status_code == 201:
-                  print(f"\nDONE! Download: {upload_resp.json()['browser_download_url']}")
+                  print(f"\n🎉 SUCCESS! Download: {upload_resp.json()['browser_download_url']}")
+                  sys.stdout.flush()
               else:
-                  print(f"Upload failed: {upload_resp.status_code} {upload_resp.text}")
+                  print(f"❌ Upload failed: {upload_resp.status_code} {upload_resp.text}")
+                  sys.stdout.flush()
                   exit(1)
 
               # Cleanup chunks from engine repo after successful upload
+              print("\n🧹 Cleaning up chunks from engine repo...", flush=True)
               proc = await asyncio.create_subprocess_exec(
                   "bash", "-c",
                   'git config user.name "github-actions[bot]" && '
                   'git config user.email "github-actions[bot]@users.noreply.github.com" && '
-                  'git pull --rebase origin main && '
+                  'git pull --rebase origin main 2>&1 | grep -v "Already up to date" || true && '
                   'rm -rf chunks/ && '
                   'git add -A && '
                   'git diff --cached --quiet || git commit -m "Cleanup: chunks deleted after merge" && '
@@ -223,7 +247,8 @@ jobs:
                   stderr=asyncio.subprocess.PIPE
               )
               await proc.communicate()
-              print("Chunks cleaned from engine repo!")
+              print("✅ Chunks cleaned from engine repo!")
+              sys.stdout.flush()
 
           asyncio.run(main())
           PYEOF
