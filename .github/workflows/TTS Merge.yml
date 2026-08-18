@@ -2,6 +2,11 @@ name: TTS Merge
 
 on:
   workflow_dispatch:
+    inputs:
+      novel_name:
+        description: 'Optional novel name forwarded from main run (leave blank to use default timestamped name)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -27,7 +32,30 @@ jobs:
           pip install requests -q
           sudo apt-get install -y -q ffmpeg
 
+      - name: Compute final filename
+        id: finalname
+        shell: bash
+        run: |
+          # If a novel name was supplied via workflow_dispatch, slugify and append .mp3, otherwise leave empty
+          if [ -n "${{ github.event.inputs.novel_name }}" ]; then
+            final=$(python3 - <<'PY'
+import sys,unicodedata,re
+s = sys.argv[1]
+s = unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode('ascii')
+s = re.sub(r'[^\w\s-]','', s).strip().lower()
+s = re.sub(r'[-\s]+','_', s)[:100].strip('_') or 'novel'
+print(s + '.mp3')
+PY
+"${{ github.event.inputs.novel_name }}" )
+          else
+            final=""
+          fi
+          echo "final_name=$final" >> $GITHUB_OUTPUT
+
       - name: Verify all chunks present, then merge
+        env:
+          PAT: ${{ secrets.PAT }}
+          FINAL_NAME: ${{ steps.finalname.outputs.final_name }}
         run: |
           python - <<'PYEOF'
           import os, glob, subprocess, time, requests
@@ -57,7 +85,11 @@ jobs:
 
           print("\nAll chunks present! Merging...")
           timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-          OUTPUT      = f"andrew_{timestamp}.mp3"
+          env_final = os.environ.get("FINAL_NAME","").strip()
+          if env_final:
+              OUTPUT = env_final
+          else:
+              OUTPUT = f"andrew_{timestamp}.mp3"
           list_path   = f"{CHUNK_DIR}/filelist.txt"
           merge_start = time.time()
 
@@ -116,15 +148,3 @@ jobs:
 
           os.remove(list_path)
           PYEOF
-        env:
-          PAT: ${{ secrets.PAT }}
-
-      - name: Clean up chunks and claims from engine repo
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin main
-          rm -rf chunks/ claims/
-          git add -A
-          git diff --cached --quiet || git commit -m "Cleanup: chunks and claims deleted after merge"
-          git push
