@@ -146,5 +146,8 @@ PY
               print(f"Upload failed: {upload_resp.status_code} {upload_resp.text}")
               exit(1)
 
-          os.remove(list_path)
+          try:
+              os.remove(list_path)
+          except:
+              pass
           PYEOF
