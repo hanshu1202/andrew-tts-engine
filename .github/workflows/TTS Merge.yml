@@ -1,0 +1,130 @@
+name: TTS Merge
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout engine repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests -q
+          sudo apt-get install -y -q ffmpeg
+
+      - name: Verify all chunks present, then merge
+        run: |
+          python - <<'PYEOF'
+          import os, glob, subprocess, time, requests
+          from datetime import datetime
+
+          CHUNK_SIZE = 5000
+          CHUNK_DIR  = "chunks"
+          PAT        = os.environ["PAT"]
+          REPO       = "hanshu1202/andrew-tts-audio"
+
+          with open("input.txt", "r", encoding="utf-8") as f:
+              text = f.read().strip()
+
+          total      = len([text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)])
+          done_files = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
+          done_ids   = [int(os.path.basename(f).replace("chunk_","").replace(".mp3","")) for f in done_files]
+          missing    = [i for i in range(total) if i not in done_ids]
+
+          print(f"Total chunks: {total}")
+          print(f"Done:         {len(done_ids)}")
+          print(f"Missing:      {len(missing)}")
+
+          if missing:
+              print(f"\nStill missing chunks: {missing[:20]}{'...' if len(missing)>20 else ''}")
+              print("Aborting merge. Re-run main workflow to finish remaining chunks.")
+              exit(1)
+
+          print("\nAll chunks present! Merging...")
+          timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+          OUTPUT      = f"andrew_{timestamp}.mp3"
+          list_path   = f"{CHUNK_DIR}/filelist.txt"
+          merge_start = time.time()
+
+          with open(list_path, "w") as f:
+              for p in done_files:
+                  f.write(f"file '{os.path.abspath(p)}'\n")
+
+          process = subprocess.Popen(
+              ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", OUTPUT],
+              stderr=subprocess.PIPE, text=True
+          )
+          process.wait()
+
+          if process.returncode != 0:
+              print("Merge failed!")
+              exit(1)
+
+          size_mb = os.path.getsize(OUTPUT) / 1024 / 1024
+          elapsed = int(time.time() - merge_start)
+          print(f"Merge DONE! Time: {elapsed//60}m {elapsed%60}s")
+          print(f"File size: {size_mb:.1f} MB")
+
+          # Upload to GitHub Releases
+          headers = {"Authorization": f"token {PAT}", "Accept": "application/vnd.github.v3+json"}
+          tag = f"tts-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+          ts  = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+          print("\nCreating GitHub Release...")
+          resp = requests.post(
+              f"https://api.github.com/repos/{REPO}/releases",
+              headers=headers,
+              json={"tag_name": tag, "name": f"TTS Output — {ts}",
+                    "body": f"Auto-generated TTS audio.\nFile: {OUTPUT}",
+                    "draft": False, "prerelease": False}
+          )
+
+          if resp.status_code != 201:
+              print(f"Failed to create release: {resp.status_code} {resp.text}")
+              exit(1)
+
+          upload_url = resp.json()["upload_url"].replace("{?name,label}", "")
+          print(f"Uploading {size_mb:.1f} MB to Releases...")
+
+          with open(OUTPUT, "rb") as f:
+              upload_resp = requests.post(
+                  f"{upload_url}?name={OUTPUT}",
+                  headers={"Authorization": f"token {PAT}", "Content-Type": "audio/mpeg"},
+                  data=f, timeout=600
+              )
+
+          if upload_resp.status_code == 201:
+              print(f"\nDONE! Download: {upload_resp.json()['browser_download_url']}")
+          else:
+              print(f"Upload failed: {upload_resp.status_code} {upload_resp.text}")
+              exit(1)
+
+          os.remove(list_path)
+          PYEOF
+        env:
+          PAT: ${{ secrets.PAT }}
+
+      - name: Clean up chunks and claims from engine repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
+          rm -rf chunks/ claims/
+          git add -A
+          git diff --cached --quiet || git commit -m "Cleanup: chunks and claims deleted after merge"
+          git push
