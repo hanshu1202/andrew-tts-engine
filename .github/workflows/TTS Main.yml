@@ -39,7 +39,7 @@ jobs:
       - name: Run Worker
         run: |
           python - <<'PYEOF'
-          import asyncio, edge_tts, time, os, glob, subprocess, requests, random
+          import asyncio, edge_tts, time, os, glob, subprocess, requests, random, sys
 
           VOICE      = "en-US-AndrewMultilingualNeural"
           CHUNK_SIZE = 5000
@@ -58,7 +58,7 @@ jobs:
 
           all_chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
           total      = len(all_chunks)
-          print(f"Worker {WORKER_ID} online. Total chunks in text: {total}")
+          print(f"Worker {WORKER_ID} online. Total chunks in text: {total}", flush=True)
 
           def run(cmd):
               return subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -110,12 +110,12 @@ jobs:
                       f.write(str(time.time()))
 
                   run(f"git add {claim_path}")
-                  commit = run(f'git commit -m "W{WORKER_ID} claims chunk {pick}"')
+                  _ = run(f'git commit -m "W{WORKER_ID} claims chunk {pick}"')
                   if git_push():
                       return pick
                   else:
                       # someone else pushed first, retry
-                      print(f"  claim collision on chunk {pick}, retrying...")
+                      print(f"  claim collision on chunk {pick}, retrying...", flush=True)
                       time.sleep(random.uniform(1, 3))
               return "retry_failed"
 
@@ -126,12 +126,12 @@ jobs:
                   try:
                       comm = edge_tts.Communicate(chunk, VOICE)
                       await comm.save(path)
-                      print(f"  ✓ chunk {idx+1}/{total} done (Worker {WORKER_ID})")
+                      print(f"  ✓ chunk {idx+1}/{total} done (Worker {WORKER_ID})", flush=True)
                       return True
                   except Exception as e:
-                      print(f"  chunk {idx+1} attempt {attempt+1} failed: {e}")
+                      print(f"  chunk {idx+1} attempt {attempt+1} failed: {e}", flush=True)
                       await asyncio.sleep(5)
-              print(f"  chunk {idx+1} failed 3 times, releasing claim.")
+              print(f"  chunk {idx+1} failed 3 times, releasing claim.", flush=True)
               return False
 
           def release_and_save(idx, success):
@@ -143,7 +143,8 @@ jobs:
               if os.path.exists(claim_path):
                   os.remove(claim_path)
               run(f"git add {CLAIM_DIR}")
-              run(f'git commit -m "W{WORKER_ID}: chunk {idx} {"done" if success else "released"}"')
+              status = "done" if success else "released"
+              run(f'git commit -m "W{WORKER_ID}: chunk {idx} {status}"')
               for attempt in range(5):
                   if git_push():
                       return
@@ -155,38 +156,49 @@ jobs:
               d = done_ids()
               if len(d) < total:
                   return
-              print(f"\nAll {total} chunks done! Worker {WORKER_ID} triggering merge...")
+              print(f"\nAll {total} chunks done! Worker {WORKER_ID} triggering merge...", flush=True)
               headers = {"Authorization": f"token {PAT}", "Accept": "application/vnd.github.v3+json"}
+              # Note: workflow filename needs URL-encoding for spaces
               resp = requests.post(
-                  f"https://api.github.com/repos/{REPO}/actions/workflows/merge.yml/dispatches",
+                  f"https://api.github.com/repos/{REPO}/actions/workflows/TTS%20Merge.yml/dispatches",
                   headers=headers, json={"ref": "main", "inputs": {"novel_name": NOVEL_NAME}}
               )
-              print(f"Merge trigger status: {resp.status_code}")
+              print(f"Merge trigger status: {resp.status_code}", flush=True)
+              if resp.status_code not in (204, 201):
+                  print("Merge dispatch response text:", resp.text, flush=True)
 
           async def main():
               batch_start   = time.time()
               chunks_done   = 0
+              last_print = time.time()
 
               while True:
                   idx = try_claim()
                   if idx is None:
-                      print(f"\nNo more chunks left to claim. Worker {WORKER_ID} exiting.")
+                      print(f"\nNo more chunks left to claim. Worker {WORKER_ID} exiting.", flush=True)
                       break
                   if idx == "retry_failed":
-                      print("Too many claim collisions, retrying loop...")
+                      print("Too many claim collisions, retrying loop...", flush=True)
                       await asyncio.sleep(2)
                       continue
 
                   elapsed = int(time.time() - batch_start)
-                  print(f"Worker {WORKER_ID} claimed chunk {idx+1}/{total}  Elapsed: {elapsed//60}m {elapsed%60}s")
+                  print(f"Worker {WORKER_ID} claimed chunk {idx+1}/{total}  Elapsed: {elapsed//60}m {elapsed%60}s", flush=True)
 
                   success = await process_chunk(idx)
                   release_and_save(idx, success)
                   if success:
                       chunks_done += 1
 
+                  # periodic live progress every 30s or after each chunk
+                  if time.time() - last_print >= 30 or True:
+                      d = done_ids()
+                      done_count = len(d)
+                      print(f"Progress: {done_count}/{total} chunks completed (Worker {WORKER_ID}).", flush=True)
+                      last_print = time.time()
+
               elapsed = int(time.time() - batch_start)
-              print(f"\nWorker {WORKER_ID} finished. Processed {chunks_done} chunks. Time: {elapsed//60}m {elapsed%60}s")
+              print(f"\nWorker {WORKER_ID} finished. Processed {chunks_done} chunks. Time: {elapsed//60}m {elapsed%60}s", flush=True)
 
               await check_and_trigger_merge()
 
