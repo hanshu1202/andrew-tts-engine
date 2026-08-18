@@ -1,0 +1,191 @@
+name: TTS Main (Start Here)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_id: [1, 2, 3, 4, 5, 6]
+
+    steps:
+      - name: Checkout engine repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install edge-tts requests -q
+          sudo apt-get install -y -q ffmpeg
+
+      - name: Run Worker
+        run: |
+          python - <<'PYEOF'
+          import asyncio, edge_tts, time, os, glob, subprocess, requests, random
+
+          VOICE      = "en-US-AndrewMultilingualNeural"
+          CHUNK_SIZE = 5000
+          CHUNK_DIR  = "chunks"
+          CLAIM_DIR  = "claims"
+          CLAIM_TIMEOUT = 600   # seconds before a claim is considered stale/dead
+          WORKER_ID  = "${{ matrix.worker_id }}"
+          PAT        = os.environ["PAT"]
+          REPO       = os.environ["GITHUB_REPOSITORY"]
+          os.makedirs(CHUNK_DIR, exist_ok=True)
+          os.makedirs(CLAIM_DIR, exist_ok=True)
+
+          with open("input.txt", "r", encoding="utf-8") as f:
+              text = f.read().strip()
+
+          all_chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
+          total      = len(all_chunks)
+          print(f"Worker {WORKER_ID} online. Total chunks in text: {total}")
+
+          def run(cmd):
+              return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+          def git_pull():
+              run("git config user.name 'github-actions[bot]'")
+              run("git config user.email 'github-actions[bot]@users.noreply.github.com'")
+              run("git pull --rebase origin main")
+
+          def git_push():
+              r = run("git push")
+              return r.returncode == 0
+
+          def done_ids():
+              return set(int(os.path.basename(f).replace("chunk_","").replace(".mp3",""))
+                         for f in glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
+
+          def claimed_ids():
+              claimed = set()
+              now = time.time()
+              for f in glob.glob(f"{CLAIM_DIR}/chunk_*.claim"):
+                  idx = int(os.path.basename(f).replace("chunk_","").replace(".claim",""))
+                  try:
+                      ts = float(open(f).read().strip())
+                  except:
+                      ts = 0
+                  if now - ts < CLAIM_TIMEOUT:
+                      claimed.add(idx)
+                  else:
+                      # stale claim, remove it so others can grab it
+                      try: os.remove(f)
+                      except: pass
+              return claimed
+
+          def try_claim():
+              """Attempt to claim one chunk. Returns chunk index or None if nothing left."""
+              for attempt in range(5):
+                  git_pull()
+                  d = done_ids()
+                  c = claimed_ids()
+                  available = [i for i in range(total) if i not in d and i not in c]
+
+                  if not available:
+                      return None
+
+                  pick = available[0]
+                  claim_path = f"{CLAIM_DIR}/chunk_{str(pick).zfill(5)}.claim"
+                  with open(claim_path, "w") as f:
+                      f.write(str(time.time()))
+
+                  run(f"git add {claim_path}")
+                  commit = run(f'git commit -m "W{WORKER_ID} claims chunk {pick}"')
+                  if git_push():
+                      return pick
+                  else:
+                      # someone else pushed first, retry
+                      print(f"  claim collision on chunk {pick}, retrying...")
+                      time.sleep(random.uniform(1, 3))
+              return "retry_failed"
+
+          async def process_chunk(idx):
+              path = f"{CHUNK_DIR}/chunk_{str(idx).zfill(5)}.mp3"
+              chunk = all_chunks[idx]
+              for attempt in range(3):
+                  try:
+                      comm = edge_tts.Communicate(chunk, VOICE)
+                      await comm.save(path)
+                      print(f"  ✓ chunk {idx+1}/{total} done (Worker {WORKER_ID})")
+                      return True
+                  except Exception as e:
+                      print(f"  chunk {idx+1} attempt {attempt+1} failed: {e}")
+                      await asyncio.sleep(5)
+              print(f"  chunk {idx+1} failed 3 times, releasing claim.")
+              return False
+
+          def release_and_save(idx, success):
+              claim_path = f"{CLAIM_DIR}/chunk_{str(idx).zfill(5)}.claim"
+              git_pull()
+              if success:
+                  path = f"{CHUNK_DIR}/chunk_{str(idx).zfill(5)}.mp3"
+                  run(f"git add {path}")
+              if os.path.exists(claim_path):
+                  os.remove(claim_path)
+              run(f"git add {CLAIM_DIR}")
+              run(f'git commit -m "W{WORKER_ID}: chunk {idx} {"done" if success else "released"}"')
+              for attempt in range(5):
+                  if git_push():
+                      return
+                  git_pull()
+                  time.sleep(random.uniform(1, 2))
+
+          async def check_and_trigger_merge():
+              git_pull()
+              d = done_ids()
+              if len(d) < total:
+                  return
+              print(f"\nAll {total} chunks done! Worker {WORKER_ID} triggering merge...")
+              headers = {"Authorization": f"token {PAT}", "Accept": "application/vnd.github.v3+json"}
+              resp = requests.post(
+                  f"https://api.github.com/repos/{REPO}/actions/workflows/merge.yml/dispatches",
+                  headers=headers, json={"ref": "main"}
+              )
+              print(f"Merge trigger status: {resp.status_code}")
+
+          async def main():
+              batch_start   = time.time()
+              chunks_done   = 0
+
+              while True:
+                  idx = try_claim()
+                  if idx is None:
+                      print(f"\nNo more chunks left to claim. Worker {WORKER_ID} exiting.")
+                      break
+                  if idx == "retry_failed":
+                      print("Too many claim collisions, retrying loop...")
+                      await asyncio.sleep(2)
+                      continue
+
+                  elapsed = int(time.time() - batch_start)
+                  print(f"Worker {WORKER_ID} claimed chunk {idx+1}/{total}  Elapsed: {elapsed//60}m {elapsed%60}s")
+
+                  success = await process_chunk(idx)
+                  release_and_save(idx, success)
+                  if success:
+                      chunks_done += 1
+
+              elapsed = int(time.time() - batch_start)
+              print(f"\nWorker {WORKER_ID} finished. Processed {chunks_done} chunks. Time: {elapsed//60}m {elapsed%60}s")
+
+              await check_and_trigger_merge()
+
+          asyncio.run(main())
+          PYEOF
+        env:
+          PAT: ${{ secrets.PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
