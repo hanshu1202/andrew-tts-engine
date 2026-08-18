@@ -2,6 +2,11 @@ name: TTS Main (Start Here)
 
 on:
   workflow_dispatch:
+    inputs:
+      novel_name:
+        description: 'Optional novel name (leave blank to use default)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -44,6 +49,7 @@ jobs:
           WORKER_ID  = "${{ matrix.worker_id }}"
           PAT        = os.environ["PAT"]
           REPO       = os.environ["GITHUB_REPOSITORY"]
+          NOVEL_NAME = os.environ.get("NOVEL_NAME", "")
           os.makedirs(CHUNK_DIR, exist_ok=True)
           os.makedirs(CLAIM_DIR, exist_ok=True)
 
@@ -153,7 +159,7 @@ jobs:
               headers = {"Authorization": f"token {PAT}", "Accept": "application/vnd.github.v3+json"}
               resp = requests.post(
                   f"https://api.github.com/repos/{REPO}/actions/workflows/merge.yml/dispatches",
-                  headers=headers, json={"ref": "main"}
+                  headers=headers, json={"ref": "main", "inputs": {"novel_name": NOVEL_NAME}}
               )
               print(f"Merge trigger status: {resp.status_code}")
 
@@ -189,3 +195,4 @@ jobs:
         env:
           PAT: ${{ secrets.PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          NOVEL_NAME: ${{ github.event.inputs.novel_name }}
