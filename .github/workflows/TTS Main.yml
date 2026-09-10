@@ -1,24 +1,20 @@
-name: TTS Main (Start Here)
+name: Andrew TTS
 
 on:
   workflow_dispatch:
     inputs:
-      novel_name:
-        description: 'Optional novel name (leave blank to use default)'
+      text_input:
+        description: "Paste text here (or leave blank to use input.txt from repo)"
         required: false
-        default: ''
+        default: ""
 
 permissions:
   contents: write
 
 jobs:
-  worker:
+  tts:
     runs-on: ubuntu-latest
     timeout-minutes: 350
-    strategy:
-      fail-fast: false
-      matrix:
-        worker_id: [1, 2, 3, 4, 5, 6]
 
     steps:
       - name: Checkout engine repo
@@ -36,175 +32,225 @@ jobs:
           pip install edge-tts requests -q
           sudo apt-get install -y -q ffmpeg
 
-      - name: Run Worker
+      - name: Prepare input text
+        run: |
+          if [ -n "${{ github.event.inputs.text_input }}" ]; then
+            echo "${{ github.event.inputs.text_input }}" > input.txt
+          elif [ -f "input.txt" ]; then
+            echo "Using input.txt from repo."
+          else
+            echo "ERROR: No input.txt found."
+            exit 1
+          fi
+
+      - name: Run TTS
         run: |
           python - <<'PYEOF'
-          import asyncio, edge_tts, time, os, glob, subprocess, requests, random, sys
+          import asyncio, edge_tts, time, os, glob, subprocess, requests, sys
+          from datetime import datetime
 
-          VOICE      = "en-US-AndrewMultilingualNeural"
-          CHUNK_SIZE = 5000
-          CHUNK_DIR  = "chunks"
-          CLAIM_DIR  = "claims"
-          CLAIM_TIMEOUT = 600   # seconds before a claim is considered stale/dead
-          WORKER_ID  = "${{ matrix.worker_id }}"
-          PAT        = os.environ["PAT"]
-          REPO       = os.environ["GITHUB_REPOSITORY"]
-          NOVEL_NAME = os.environ.get("NOVEL_NAME", "")
+          VOICE       = "en-US-AndrewMultilingualNeural"
+          CHUNK_SIZE  = 5000
+          CHUNK_DIR   = "chunks"   # saved in engine repo
+          BATCH_SIZE  = 5
+          BATCH_PAUSE = 3
+          PAT         = os.environ["PAT"]
+          REPO        = "hanshu1202/andrew-tts-audio"
           os.makedirs(CHUNK_DIR, exist_ok=True)
-          os.makedirs(CLAIM_DIR, exist_ok=True)
 
           with open("input.txt", "r", encoding="utf-8") as f:
               text = f.read().strip()
 
           all_chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
           total      = len(all_chunks)
-          print(f"Worker {WORKER_ID} online. Total chunks in text: {total}", flush=True)
+          print(f"📊 Total characters: {len(text):,}")
+          print(f"📊 Total chunks: {total}")
+          print(f"🎯 Chunk size: {CHUNK_SIZE} chars | Batch size: {BATCH_SIZE}")
+          sys.stdout.flush()
 
-          def run(cmd):
-              return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+          # Delete last chunk (corruption protection)
+          existing = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
+          if existing:
+              last = existing[-1]
+              os.remove(last)
+              print(f"⚠️  Deleted last chunk (safety): {os.path.basename(last)}")
+              start_idx = len(existing) - 1
+              print(f"▶️  Resuming from chunk {start_idx+1}...")
+              sys.stdout.flush()
+          else:
+              start_idx = 0
+              print("✨ Fresh run!")
+              sys.stdout.flush()
 
-          def git_pull():
-              run("git config user.name 'github-actions[bot]'")
-              run("git config user.email 'github-actions[bot]@users.noreply.github.com'")
-              run("git pull --rebase origin main")
+          async def git_push(done):
+              print(f"  💾 Saving progress to git ({done} chunks done)...", end=" ", flush=True)
+              proc = await asyncio.create_subprocess_exec(
+                  "bash", "-c",
+                  f'git config user.name "github-actions[bot]" && '
+                  f'git config user.email "github-actions[bot]@users.noreply.github.com" && '
+                  f'git pull --rebase origin main 2>&1 | grep -v "Already up to date" || true && '
+                  f'git add chunks/ && '
+                  f'git diff --cached --quiet || git commit -m "Progress: {done} chunks done" && '
+                  f'git push',
+                  stdout=asyncio.subprocess.PIPE,
+                  stderr=asyncio.subprocess.PIPE
+              )
+              await proc.communicate()
+              print("✅ synced!")
+              sys.stdout.flush()
 
-          def git_push():
-              r = run("git push")
-              return r.returncode == 0
-
-          def done_ids():
-              return set(int(os.path.basename(f).replace("chunk_","").replace(".mp3",""))
-                         for f in glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
-
-          def claimed_ids():
-              claimed = set()
-              now = time.time()
-              for f in glob.glob(f"{CLAIM_DIR}/chunk_*.claim"):
-                  idx = int(os.path.basename(f).replace("chunk_","").replace(".claim",""))
-                  try:
-                      ts = float(open(f).read().strip())
-                  except:
-                      ts = 0
-                  if now - ts < CLAIM_TIMEOUT:
-                      claimed.add(idx)
-                  else:
-                      # stale claim, remove it so others can grab it
-                      try: os.remove(f)
-                      except: pass
-              return claimed
-
-          def try_claim():
-              """Attempt to claim one chunk. Returns chunk index or None if nothing left."""
-              for attempt in range(5):
-                  git_pull()
-                  d = done_ids()
-                  c = claimed_ids()
-                  available = [i for i in range(total) if i not in d and i not in c]
-
-                  if not available:
-                      return None
-
-                  pick = available[0]
-                  claim_path = f"{CLAIM_DIR}/chunk_{str(pick).zfill(5)}.claim"
-                  with open(claim_path, "w") as f:
-                      f.write(str(time.time()))
-
-                  run(f"git add {claim_path}")
-                  _ = run(f'git commit -m "W{WORKER_ID} claims chunk {pick}"')
-                  if git_push():
-                      return pick
-                  else:
-                      # someone else pushed first, retry
-                      print(f"  claim collision on chunk {pick}, retrying...", flush=True)
-                      time.sleep(random.uniform(1, 3))
-              return "retry_failed"
-
-          async def process_chunk(idx):
+          async def process_chunk(idx, chunk):
               path = f"{CHUNK_DIR}/chunk_{str(idx).zfill(5)}.mp3"
-              chunk = all_chunks[idx]
+              if os.path.exists(path):
+                  print(f"    ⏭️  chunk {idx+1}/{total} already exists, skipping", flush=True)
+                  return path
               for attempt in range(3):
                   try:
+                      print(f"    🔄 chunk {idx+1}/{total} (attempt {attempt+1})...", end=" ", flush=True)
                       comm = edge_tts.Communicate(chunk, VOICE)
                       await comm.save(path)
-                      print(f"  ✓ chunk {idx+1}/{total} done (Worker {WORKER_ID})", flush=True)
-                      return True
+                      print(f"✓ done!", flush=True)
+                      return path
                   except Exception as e:
-                      print(f"  chunk {idx+1} attempt {attempt+1} failed: {e}", flush=True)
-                      await asyncio.sleep(5)
-              print(f"  chunk {idx+1} failed 3 times, releasing claim.", flush=True)
-              return False
-
-          def release_and_save(idx, success):
-              claim_path = f"{CLAIM_DIR}/chunk_{str(idx).zfill(5)}.claim"
-              git_pull()
-              if success:
-                  path = f"{CHUNK_DIR}/chunk_{str(idx).zfill(5)}.mp3"
-                  run(f"git add {path}")
-              if os.path.exists(claim_path):
-                  os.remove(claim_path)
-              run(f"git add {CLAIM_DIR}")
-              status = "done" if success else "released"
-              run(f'git commit -m "W{WORKER_ID}: chunk {idx} {status}"')
-              for attempt in range(5):
-                  if git_push():
-                      return
-                  git_pull()
-                  time.sleep(random.uniform(1, 2))
-
-          async def check_and_trigger_merge():
-              git_pull()
-              d = done_ids()
-              if len(d) < total:
-                  return
-              print(f"\nAll {total} chunks done! Worker {WORKER_ID} triggering merge...", flush=True)
-              headers = {"Authorization": f"token {PAT}", "Accept": "application/vnd.github.v3+json"}
-              # Note: workflow filename needs URL-encoding for spaces
-              resp = requests.post(
-                  f"https://api.github.com/repos/{REPO}/actions/workflows/TTS%20Merge.yml/dispatches",
-                  headers=headers, json={"ref": "main", "inputs": {"novel_name": NOVEL_NAME}}
-              )
-              print(f"Merge trigger status: {resp.status_code}", flush=True)
-              if resp.status_code not in (204, 201):
-                  print("Merge dispatch response text:", resp.text, flush=True)
+                      print(f"❌ failed: {str(e)[:50]}", flush=True)
+                      if attempt < 2:
+                          print(f"    ⏳ retrying in 5s...", flush=True)
+                          await asyncio.sleep(5)
+              print(f"    ⛔ chunk {idx+1} failed all 3 attempts, skipping.", flush=True)
+              return None
 
           async def main():
-              batch_start   = time.time()
-              chunks_done   = 0
-              last_print = time.time()
+              batch_start = time.time()
+              chunk_times = []
+              done_count  = 0
 
-              while True:
-                  idx = try_claim()
-                  if idx is None:
-                      print(f"\nNo more chunks left to claim. Worker {WORKER_ID} exiting.", flush=True)
-                      break
-                  if idx == "retry_failed":
-                      print("Too many claim collisions, retrying loop...", flush=True)
-                      await asyncio.sleep(2)
-                      continue
-
+              for b in range(start_idx, total, BATCH_SIZE):
+                  batch   = [(i, all_chunks[i]) for i in range(b, min(b+BATCH_SIZE, total))]
                   elapsed = int(time.time() - batch_start)
-                  print(f"Worker {WORKER_ID} claimed chunk {idx+1}/{total}  Elapsed: {elapsed//60}m {elapsed%60}s", flush=True)
+                  percent = int((b / total) * 100)
 
-                  success = await process_chunk(idx)
-                  release_and_save(idx, success)
-                  if success:
-                      chunks_done += 1
+                  if chunk_times:
+                      avg = sum(chunk_times) / len(chunk_times)
+                      eta = int(avg * (total - b))
+                      eta_str = f"{eta//60}m {eta%60}s"
+                  else:
+                      eta_str = "calculating..."
 
-                  # periodic live progress every 30s or after each chunk
-                  if time.time() - last_print >= 30 or True:
-                      d = done_ids()
-                      done_count = len(d)
-                      print(f"Progress: {done_count}/{total} chunks completed (Worker {WORKER_ID}).", flush=True)
-                      last_print = time.time()
+                  elapsed_str = f"{elapsed//60}m {elapsed%60}s"
+                  print(f"\n📦 Batch {b//BATCH_SIZE+1} | Chunk {b+1}/{total} ({percent}%) | ETA: {eta_str} | Elapsed: {elapsed_str}")
+                  sys.stdout.flush()
 
-              elapsed = int(time.time() - batch_start)
-              print(f"\nWorker {WORKER_ID} finished. Processed {chunks_done} chunks. Time: {elapsed//60}m {elapsed%60}s", flush=True)
+                  t       = time.time()
+                  results = await asyncio.gather(*[process_chunk(idx, chunk) for idx, chunk in batch])
+                  chunk_times.append((time.time() - t) / len(batch))
+                  done_count += sum(1 for r in results if r)
 
-              await check_and_trigger_merge()
+                  print(f"  ✨ Batch complete! ({done_count}/{total} chunks done total)")
+                  sys.stdout.flush()
+
+                  # Save progress to engine repo every batch
+                  await git_push(done_count)
+
+                  if b + BATCH_SIZE < total:
+                      print(f"  ⏸️  Pausing {BATCH_PAUSE}s before next batch...", flush=True)
+                      await asyncio.sleep(BATCH_PAUSE)
+
+              # Merge locally
+              done_files  = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
+              print(f"\n🎬 Merging {len(done_files)} chunks locally...")
+              sys.stdout.flush()
+              timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+              OUTPUT      = f"/tmp/andrew_{timestamp}.mp3"
+              list_path   = f"{CHUNK_DIR}/filelist.txt"
+              merge_start = time.time()
+
+              with open(list_path, "w") as f:
+                  for p in done_files:
+                      f.write(f"file '{os.path.abspath(p)}'\n")
+
+              process = subprocess.Popen(
+                  ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", OUTPUT],
+                  stderr=subprocess.PIPE, text=True
+              )
+              process.wait()
+
+              if process.returncode != 0:
+                  print("❌ Merge failed!")
+                  sys.stdout.flush()
+                  exit(1)
+
+              size_mb = os.path.getsize(OUTPUT) / 1024 / 1024
+              elapsed = int(time.time() - merge_start)
+              print(f"✅ Merge DONE! Time: {elapsed//60}m {elapsed%60}s | Size: {size_mb:.1f} MB")
+              sys.stdout.flush()
+
+              # Upload to GitHub Releases
+              headers = {
+                  "Authorization": f"token {PAT}",
+                  "Accept":        "application/vnd.github.v3+json"
+              }
+              tag       = f"tts-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+              timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+              print("\n📤 Creating GitHub Release...", flush=True)
+              resp = requests.post(
+                  f"https://api.github.com/repos/{REPO}/releases",
+                  headers=headers,
+                  json={
+                      "tag_name":   tag,
+                      "name":       f"TTS Output — {timestamp}",
+                      "body":       f"Auto-generated TTS audio.\nFile: {os.path.basename(OUTPUT)}",
+                      "draft":      False,
+                      "prerelease": False
+                  }
+              )
+
+              if resp.status_code != 201:
+                  print(f"❌ Failed to create release: {resp.status_code} {resp.text}")
+                  sys.stdout.flush()
+                  exit(1)
+
+              upload_url = resp.json()["upload_url"].replace("{?name,label}", "")
+              print(f"📡 Uploading {size_mb:.1f} MB to Releases...", flush=True)
+
+              with open(OUTPUT, "rb") as f:
+                  upload_resp = requests.post(
+                      f"{upload_url}?name={os.path.basename(OUTPUT)}",
+                      headers={
+                          "Authorization": f"token {PAT}",
+                          "Content-Type":  "audio/mpeg"
+                      },
+                      data=f,
+                      timeout=600
+                  )
+
+              if upload_resp.status_code == 201:
+                  print(f"\n🎉 SUCCESS! Download: {upload_resp.json()['browser_download_url']}")
+                  sys.stdout.flush()
+              else:
+                  print(f"❌ Upload failed: {upload_resp.status_code} {upload_resp.text}")
+                  sys.stdout.flush()
+                  exit(1)
+
+              # Cleanup chunks from engine repo after successful upload
+              print("\n🧹 Cleaning up chunks from engine repo...", flush=True)
+              proc = await asyncio.create_subprocess_exec(
+                  "bash", "-c",
+                  'git config user.name "github-actions[bot]" && '
+                  'git config user.email "github-actions[bot]@users.noreply.github.com" && '
+                  'git pull --rebase origin main 2>&1 | grep -v "Already up to date" || true && '
+                  'rm -rf chunks/ && '
+                  'git add -A && '
+                  'git diff --cached --quiet || git commit -m "Cleanup: chunks deleted after merge" && '
+                  'git push',
+                  stdout=asyncio.subprocess.PIPE,
+                  stderr=asyncio.subprocess.PIPE
+              )
+              await proc.communicate()
+              print("✅ Chunks cleaned from engine repo!")
+              sys.stdout.flush()
 
           asyncio.run(main())
           PYEOF
         env:
           PAT: ${{ secrets.PAT }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          NOVEL_NAME: ${{ github.event.inputs.novel_name }}
