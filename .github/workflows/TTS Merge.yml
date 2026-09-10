@@ -1,5 +1,4 @@
 name: TTS Merge
-
 on:
   workflow_dispatch:
     inputs:
@@ -15,7 +14,6 @@ jobs:
   merge:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
     steps:
       - name: Checkout engine repo
         uses: actions/checkout@v4
@@ -35,18 +33,19 @@ jobs:
       - name: Compute final filename
         id: finalname
         shell: bash
+        env:
+          INPUT_NOVEL_NAME: ${{ github.event.inputs.novel_name }}
         run: |
-          # If a novel name was supplied via workflow_dispatch, slugify and append .mp3, otherwise leave empty
-          if [ -n "${{ github.event.inputs.novel_name }}" ]; then
+          if [ -n "$INPUT_NOVEL_NAME" ]; then
             final=$(python3 - <<'PY'
-import sys,unicodedata,re
-s = sys.argv[1]
+import os, unicodedata, re
+s = os.environ.get("INPUT_NOVEL_NAME", "")
 s = unicodedata.normalize('NFKD', s).encode('ascii','ignore').decode('ascii')
 s = re.sub(r'[^\w\s-]','', s).strip().lower()
 s = re.sub(r'[-\s]+','_', s)[:100].strip('_') or 'novel'
 print(s + '.mp3')
 PY
-"${{ github.event.inputs.novel_name }}" )
+)
           else
             final=""
           fi
@@ -56,98 +55,107 @@ PY
         env:
           PAT: ${{ secrets.PAT }}
           FINAL_NAME: ${{ steps.finalname.outputs.final_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python - <<'PYEOF'
-          import os, glob, subprocess, time, requests
-          from datetime import datetime
+import os, glob, subprocess, time, requests
+from datetime import datetime
 
-          CHUNK_SIZE = 5000
-          CHUNK_DIR  = "chunks"
-          PAT        = os.environ["PAT"]
-          REPO       = "hanshu1202/andrew-tts-audio"
+CHUNK_SIZE = 5000
+CHUNK_DIR = "chunks"
+PAT = os.environ["PAT"]
+REPO = os.environ["GITHUB_REPOSITORY"]
 
-          with open("input.txt", "r", encoding="utf-8") as f:
-              text = f.read().strip()
+with open("input.txt", "r", encoding="utf-8") as f:
+    text = f.read().strip()
 
-          total      = len([text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)])
-          done_files = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
-          done_ids   = [int(os.path.basename(f).replace("chunk_","").replace(".mp3","")) for f in done_files]
-          missing    = [i for i in range(total) if i not in done_ids]
+total = len([text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)])
+done_files = sorted(glob.glob(f"{CHUNK_DIR}/chunk_*.mp3"))
+done_ids = [int(os.path.basename(f).replace("chunk_","").replace(".mp3","")) for f in done_files]
+missing = [i for i in range(total) if i not in done_ids]
 
-          print(f"Total chunks: {total}")
-          print(f"Done:         {len(done_ids)}")
-          print(f"Missing:      {len(missing)}")
+print(f"Total chunks: {total}")
+print(f"Done: {len(done_ids)}")
+print(f"Missing: {len(missing)}")
 
-          if missing:
-              print(f"\nStill missing chunks: {missing[:20]}{'...' if len(missing)>20 else ''}")
-              print("Aborting merge. Re-run main workflow to finish remaining chunks.")
-              exit(1)
+if missing:
+    print(f"\nStill missing chunks: {missing[:20]}{'...' if len(missing)>20 else ''}")
+    print("Aborting merge. Re-run main workflow to finish remaining chunks.")
+    exit(1)
 
-          print("\nAll chunks present! Merging...")
-          timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-          env_final = os.environ.get("FINAL_NAME","").strip()
-          if env_final:
-              OUTPUT = env_final
-          else:
-              OUTPUT = f"andrew_{timestamp}.mp3"
-          list_path   = f"{CHUNK_DIR}/filelist.txt"
-          merge_start = time.time()
+print("\nAll chunks present! Merging...")
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+env_final = os.environ.get("FINAL_NAME","").strip()
 
-          with open(list_path, "w") as f:
-              for p in done_files:
-                  f.write(f"file '{os.path.abspath(p)}'\n")
+if env_final:
+    OUTPUT = env_final
+else:
+    OUTPUT = f"andrew_{timestamp}.mp3"
 
-          process = subprocess.Popen(
-              ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", OUTPUT],
-              stderr=subprocess.PIPE, text=True
-          )
-          process.wait()
+list_path = f"{CHUNK_DIR}/filelist.txt"
+merge_start = time.time()
 
-          if process.returncode != 0:
-              print("Merge failed!")
-              exit(1)
+with open(list_path, "w") as f:
+    for p in done_files:
+        f.write(f"file '{os.path.abspath(p)}'\n")
 
-          size_mb = os.path.getsize(OUTPUT) / 1024 / 1024
-          elapsed = int(time.time() - merge_start)
-          print(f"Merge DONE! Time: {elapsed//60}m {elapsed%60}s")
-          print(f"File size: {size_mb:.1f} MB")
+process = subprocess.Popen(
+    ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", OUTPUT],
+    stderr=subprocess.PIPE,
+    text=True
+)
+process.wait()
 
-          # Upload to GitHub Releases
-          headers = {"Authorization": f"token {PAT}", "Accept": "application/vnd.github.v3+json"}
-          tag = f"tts-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-          ts  = datetime.now().strftime("%Y-%m-%d %H:%M")
+if process.returncode != 0:
+    print("Merge failed!")
+    exit(1)
 
-          print("\nCreating GitHub Release...")
-          resp = requests.post(
-              f"https://api.github.com/repos/{REPO}/releases",
-              headers=headers,
-              json={"tag_name": tag, "name": f"TTS Output — {ts}",
-                    "body": f"Auto-generated TTS audio.\nFile: {OUTPUT}",
-                    "draft": False, "prerelease": False}
-          )
+size_mb = os.path.getsize(OUTPUT) / 1024 / 1024
+elapsed = int(time.time() - merge_start)
+print(f"Merge DONE! Time: {elapsed//60}m {elapsed%60}s")
+print(f"File size: {size_mb:.1f} MB")
 
-          if resp.status_code != 201:
-              print(f"Failed to create release: {resp.status_code} {resp.text}")
-              exit(1)
+# Upload to GitHub Releases
+headers = {"Authorization": f"token {PAT}", "Accept": "application/vnd.github.v3+json"}
+tag = f"tts-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+ts = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-          upload_url = resp.json()["upload_url"].replace("{?name,label}", "")
-          print(f"Uploading {size_mb:.1f} MB to Releases...")
+print("\nCreating GitHub Release...")
+resp = requests.post(
+    f"https://github.com{REPO}/releases",
+    headers=headers,
+    json={
+        "tag_name": tag,
+        "name": f"TTS Output — {ts}",
+        "body": f"Auto-generated TTS audio.\nFile: {OUTPUT}",
+        "draft": False,
+        "prerelease": False
+    }
+)
 
-          with open(OUTPUT, "rb") as f:
-              upload_resp = requests.post(
-                  f"{upload_url}?name={OUTPUT}",
-                  headers={"Authorization": f"token {PAT}", "Content-Type": "audio/mpeg"},
-                  data=f, timeout=600
-              )
+if resp.status_code != 201:
+    print(f"Failed to create release: {resp.status_code} {resp.text}")
+    exit(1)
 
-          if upload_resp.status_code == 201:
-              print(f"\nDONE! Download: {upload_resp.json()['browser_download_url']}")
-          else:
-              print(f"Upload failed: {upload_resp.status_code} {upload_resp.text}")
-              exit(1)
+upload_url = resp.json()["upload_url"].replace("{?name,label}", "")
+print(f"Uploading {size_mb:.1f} MB to Releases...")
 
-          try:
-              os.remove(list_path)
-          except:
-              pass
-          PYEOF
+with open(OUTPUT, "rb") as f:
+    upload_resp = requests.post(
+        f"{upload_url}?name={OUTPUT}",
+        headers={"Authorization": f"token {PAT}", "Content-Type": "audio/mpeg"},
+        data=f,
+        timeout=600
+    )
+
+if upload_resp.status_code == 201:
+    print(f"\nDONE! Download: {upload_resp.json()['browser_download_url']}")
+else:
+    print(f"Upload failed: {upload_resp.status_code} {upload_resp.text}")
+    exit(1)
+
+try:
+    os.remove(list_path)
+except:
+    pass
+PYEOF
