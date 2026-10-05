@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       total_chunks: ${{ steps.init.outputs.total_chunks }}
+      worker_count: ${{ steps.init.outputs.worker_count }}
+      worker_matrix: ${{ steps.init.outputs.worker_matrix }}
     steps:
       - uses: actions/checkout@v4
       - name: Prepare and Reset Coordinator
@@ -32,8 +34,21 @@ jobs:
           TOTAL=$(( (CHARS + 4999) / 5000 ))
           echo "total_chunks=$TOTAL" >> $GITHUB_OUTPUT
 
+          # Dynamic worker scaling: min 6, max 20, scale with chunks
+          # Rule: 1 worker per 10 chunks, clamped to [6, 20]
+          WORKERS=$(( TOTAL / 10 ))
+          if [ $WORKERS -lt 6 ]; then WORKERS=6; fi
+          if [ $WORKERS -gt 20 ]; then WORKERS=20; fi
+          echo "worker_count=$WORKERS" >> $GITHUB_OUTPUT
+
+          # Build the matrix as JSON: [1,2,3,...,WORKERS]
+          MATRIX=$(seq -s, 1 $WORKERS | sed 's/[^,]*/&/g; s/^/[/; s/$/]/')
+          echo "worker_matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "Matrix: $MATRIX"
+
           echo "Total characters: $CHARS"
           echo "Total chunks: $TOTAL"
+          echo "Spawning $WORKERS workers"
 
           # Reset Coordinator for a fresh run
           curl -s -X POST "${{ secrets.COORD_URL }}/reset?total=$TOTAL" \
@@ -46,8 +61,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # Spawn 6 identical workers simultaneously
-        worker_id: [1, 2, 3, 4, 5, 6]
+        # Dynamic worker count based on chunk size (6-20 workers)
+        worker_id: ${{ fromJson(needs.split_and_init.outputs.worker_matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
