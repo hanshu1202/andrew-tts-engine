@@ -1,0 +1,211 @@
+name: Andrew TTS (Parallel Dynamic)
+
+on:
+  workflow_dispatch:
+    inputs:
+      text_input:
+        description: "Paste text here (or leave blank to use input.txt)"
+        required: false
+        default: ""
+      novel_name:
+        description: "Name of the novel (used for output filename)"
+        required: false
+        default: ""
+
+jobs:
+  split_and_init:
+    name: Initialize Run
+    runs-on: ubuntu-latest
+    outputs:
+      total_chunks: ${{ steps.init.outputs.total_chunks }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare and Reset Coordinator
+        id: init
+        run: |
+          if [ -n "${{ github.event.inputs.text_input }}" ]; then
+            echo "${{ github.event.inputs.text_input }}" > input.txt
+          fi
+
+          # Count chunks (5000 chars each)
+          CHARS=$(wc -m < input.txt)
+          TOTAL=$(( (CHARS + 4999) / 5000 ))
+          echo "total_chunks=$TOTAL" >> $GITHUB_OUTPUT
+
+          echo "Total characters: $CHARS"
+          echo "Total chunks: $TOTAL"
+
+          # Reset Coordinator for a fresh run
+          curl -s -X POST "${{ secrets.COORD_URL }}/reset?total=$TOTAL" \
+            -H "x-auth: ${{ secrets.COORD_SECRET }}"
+          echo "Coordinator reset successfully!"
+
+  process_chunks:
+    name: Worker
+    needs: split_and_init
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Spawn 6 identical workers simultaneously
+        worker_id: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install edge-tts requests
+      - name: Process Chunks Dynamically
+        run: |
+          if [ -n "${{ github.event.inputs.text_input }}" ]; then
+            echo "${{ github.event.inputs.text_input }}" > input.txt
+          fi
+
+          mkdir -p chunks
+
+          python - <<'EOF'
+          import os, sys, time, requests, subprocess
+
+          COORD_URL = "${{ secrets.COORD_URL }}"
+          COORD_SECRET = "${{ secrets.COORD_SECRET }}"
+          WORKER_ID = "${{ matrix.worker_id }}"
+          VOICE = "en-US-AndrewMultilingualNeural"
+          CHUNK_SIZE = 5000
+
+          with open("input.txt", "r", encoding="utf-8") as f:
+              text = f.read().strip()
+          all_chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
+
+          def claim_chunk():
+              try:
+                  r = requests.post(f"{COORD_URL}/claim", headers={"x-auth": COORD_SECRET}, json={"worker": WORKER_ID}, timeout=10)
+                  return r.json()
+              except Exception as e:
+                  print(f"Error claiming: {e}")
+                  return None
+
+          def mark_done(chunk_idx):
+              requests.post(f"{COORD_URL}/done", headers={"x-auth": COORD_SECRET}, json={"chunk": chunk_idx}, timeout=10)
+
+          def release(chunk_idx):
+              requests.post(f"{COORD_URL}/release", headers={"x-auth": COORD_SECRET}, json={"chunk": chunk_idx}, timeout=10)
+
+          print(f"👷 Worker {WORKER_ID} starting...")
+
+          while True:
+              claim = claim_chunk()
+              if not claim:
+                  time.sleep(2)
+                  continue
+
+              if claim.get("done"):
+                  print("🏁 All chunks have been claimed! Worker finishing.")
+                  break
+
+              chunk_idx = claim.get("chunk")
+              if chunk_idx is None:
+                  time.sleep(2)
+                  continue
+
+              print(f"🎯 Assigned chunk {chunk_idx}")
+              chunk_text = all_chunks[chunk_idx]
+              out_path = f"chunks/chunk_{str(chunk_idx).zfill(5)}.mp3"
+
+              success = False
+              for attempt in range(3):
+                  try:
+                      print(f"  Attempt {attempt+1}...")
+                      cmd = ["edge-tts", "--voice", VOICE, "--text", chunk_text, "--write-media", out_path]
+                      res = subprocess.run(cmd, capture_output=True, text=True)
+
+                      if res.returncode == 0 and os.path.exists(out_path):
+                          print(f"  ✅ Success!")
+                          mark_done(chunk_idx)
+                          success = True
+                          break
+                      else:
+                          print(f"  ❌ Failed TTS generation: {res.stderr}")
+                  except Exception as e:
+                      print(f"  ❌ Error: {e}")
+
+                  time.sleep(3)
+
+              if not success:
+                  print(f"⛔ Exhausted attempts for chunk {chunk_idx}. Releasing back to pool.")
+                  release(chunk_idx)
+          EOF
+
+      - name: Upload chunks to Artifacts (No Git Commits!)
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunks-worker-${{ matrix.worker_id }}
+          path: chunks/*.mp3
+          retention-days: 1
+          overwrite: true
+
+  merge_and_publish:
+    name: Merge and Publish
+    needs: [split_and_init, process_chunks]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get install -y -q ffmpeg
+
+      - name: Download all chunks from all workers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chunks-worker-*
+          merge-multiple: true
+          path: output_chunks
+
+      - name: Check missing chunks
+        run: |
+          echo "Checking coordination state..."
+          MISSING=$(curl -s "${{ secrets.COORD_URL }}/status" -H "x-auth: ${{ secrets.COORD_SECRET }}" | grep -o '"missing":\[[^]]*\]')
+          echo "State: $MISSING"
+
+          # We don't fail immediately, we do our best to merge what we have
+          ls -la output_chunks/
+
+      - name: Merge chunks
+        run: |
+          mkdir -p output
+          cd output_chunks
+
+          # Create safe file list
+          for f in $(ls chunk_*.mp3 | sort); do
+            echo "file '$PWD/$f'" >> ../filelist.txt
+          done
+
+          cd ..
+
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          NOVEL="${{ github.event.inputs.novel_name }}"
+          if [ -z "$NOVEL" ]; then NOVEL="andrew-audio"; fi
+          # Safe filename
+          CLEAN_NOVEL=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
+          OUTPUT_FILE="output/${CLEAN_NOVEL}_${TIMESTAMP}.mp3"
+
+          echo "Merging into $OUTPUT_FILE"
+          ffmpeg -y -f concat -safe 0 -i filelist.txt -c copy "$OUTPUT_FILE"
+
+          echo "MERGE_OUTPUT=$OUTPUT_FILE" >> $GITHUB_ENV
+
+      - name: Upload Final Audio Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-audio
+          path: ${{ env.MERGE_OUTPUT }}
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          cd output
+          FILE=$(ls *.mp3 | head -n 1)
+          TAG="tts-$(date +'%Y%m%d-%H%M%S')"
+          TITLE="TTS Output - ${{ github.event.inputs.novel_name }}"
+
+          echo "Publishing release..."
+          gh release create "$TAG" "$FILE" -t "$TITLE" -n "Merged high-speed output"
