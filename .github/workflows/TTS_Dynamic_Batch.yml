@@ -1,4 +1,4 @@
-name: Andrew TTS (Dynamic Batch)
+name: Andrew TTS (Dynamic Batch + Video)
 
 on:
   workflow_dispatch:
@@ -19,6 +19,27 @@ on:
         options:
           - fast
           - balanced
+      output_type:
+        description: "Output: audio or video"
+        required: false
+        default: "audio"
+        type: choice
+        options:
+          - audio
+          - video
+      resolution:
+        description: "Video resolution (ignored if audio only)"
+        required: false
+        default: "720"
+        type: choice
+        options:
+          - original
+          - "1080"
+          - "720"
+          - "480"
+          - "360"
+          - "240"
+          - "144"
 
 jobs:
   init:
@@ -47,7 +68,6 @@ jobs:
             MAX_WORKERS=20
           fi
 
-          # Each worker handles ~5 chunks per batch, spawn enough workers
           WORKERS=$(( (TOTAL + 4) / 5 ))
           if [ $WORKERS -lt 6 ]; then WORKERS=6; fi
           if [ $WORKERS -gt $MAX_WORKERS ]; then WORKERS=$MAX_WORKERS; fi
@@ -57,6 +77,7 @@ jobs:
 
           echo "📊 Total: $CHARS chars → $TOTAL chunks"
           echo "🏃 Mode: $MODE → spawning $WORKERS workers (max: $MAX_WORKERS)"
+          echo "🎬 Output: ${{ github.event.inputs.output_type }}"
 
           curl -s -X POST "${{ secrets.COORD_URL }}/reset?total=$TOTAL" \
             -H "x-auth: ${{ secrets.COORD_SECRET }}"
@@ -159,7 +180,6 @@ jobs:
                   batch_count += 1
                   print(f"\n📦 Batch {batch_count}: claimed chunks {chunk_ids}")
 
-                  # Process all 5 chunks concurrently (like original TTS Main)
                   tasks = [process_chunk(idx, all_chunks[idx]) for idx in chunk_ids if idx < len(all_chunks)]
                   results = await asyncio.gather(*tasks)
 
@@ -174,7 +194,6 @@ jobs:
                       release_batch(failed)
                       print(f"  ⚠️  Released {len(failed)} failed chunks back to pool")
 
-                  # Microsoft rate-limit protection: pause between batches
                   print(f"  ⏸️  Pausing {BATCH_PAUSE}s...")
                   await asyncio.sleep(BATCH_PAUSE)
 
@@ -189,9 +208,12 @@ jobs:
           retention-days: 1
 
   merge:
-    name: Merge & Publish
+    name: Merge Audio
     needs: [init, process]
     runs-on: ubuntu-latest
+    outputs:
+      audio_file: ${{ steps.merge.outputs.audio_file }}
+      audio_duration: ${{ steps.merge.outputs.audio_duration }}
     steps:
       - uses: actions/checkout@v4
       - name: Install ffmpeg
@@ -205,6 +227,7 @@ jobs:
           path: output_chunks
 
       - name: Merge chunks
+        id: merge
         run: |
           mkdir -p output
           cd output_chunks
@@ -221,25 +244,218 @@ jobs:
           OUTPUT="output/${CLEAN}_${TIMESTAMP}.mp3"
 
           ffmpeg -y -f concat -safe 0 -i filelist.txt -c copy "$OUTPUT"
-          echo "OUTPUT_FILE=$OUTPUT" >> $GITHUB_ENV
-          echo "✅ Merged into $OUTPUT"
 
-      - name: Upload artifact
+          # Get audio duration
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT")
+
+          echo "audio_file=$OUTPUT" >> $GITHUB_OUTPUT
+          echo "audio_duration=$DURATION" >> $GITHUB_OUTPUT
+          echo "✅ Merged into $OUTPUT (${DURATION}s)"
+
+      - name: Upload audio artifact
         uses: actions/upload-artifact@v4
         with:
           name: final-audio
-          path: ${{ env.OUTPUT_FILE }}
+          path: ${{ steps.merge.outputs.audio_file }}
 
-      - name: Create Release in andrew-tts-audio repo
+  video-encode:
+    name: Create Video
+    needs: [init, merge]
+    if: github.event.inputs.output_type == 'video'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get install -y -q ffmpeg
+
+      - name: Clone video source repo
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
+          git clone https://github.com/hanshu1202/andrew-tts-audio.git video-repo
+          cd video-repo
+          if [ ! -d "source_videos" ] || [ -z "$(ls -A source_videos 2>/dev/null)" ]; then
+            echo "⚠️  No source videos found in andrew-tts-audio/source_videos"
+            echo "Please upload videos to that directory first"
+            exit 1
+          fi
+          echo "✅ Found source videos:"
+          ls -lh source_videos/
+
+      - name: Download audio
+        uses: actions/download-artifact@v4
+        with:
+          name: final-audio
+          path: audio
+
+      - name: Generate video
+        run: |
+          mkdir -p output
+
+          python - <<'EOF'
+          import os, sys, subprocess, random, json
+
+          AUDIO_DURATION = float("${{ needs.merge.outputs.audio_duration }}")
+          RESOLUTION = "${{ github.event.inputs.resolution }}"
+          AUDIO_FILE = "$(ls audio/*.mp3)"
+
+          # Get all source videos
+          video_dir = "video-repo/source_videos"
+          videos = [os.path.join(video_dir, f) for f in os.listdir(video_dir)
+                   if f.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm'))]
+
+          if not videos:
+              print("❌ No video files found")
+              sys.exit(1)
+
+          print(f"🎬 Found {len(videos)} source videos")
+          print(f"🎵 Audio duration: {AUDIO_DURATION}s")
+          print(f"📐 Resolution: {RESOLUTION}")
+
+          # Get duration of each video
+          video_info = []
+          for v in videos:
+              try:
+                  result = subprocess.run(
+                      ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                       '-of', 'default=noprint_wrappers=1:nokey=1', v],
+                      capture_output=True, text=True, timeout=10
+                  )
+                  duration = float(result.stdout.strip())
+                  video_info.append({'path': v, 'duration': duration})
+                  print(f"  📹 {os.path.basename(v)}: {duration:.1f}s")
+              except Exception as e:
+                  print(f"  ⚠️  Skipping {v}: {e}")
+
+          # Build video sequence by randomly picking videos until we match audio duration
+          sequence = []
+          total_duration = 0.0
+
+          while total_duration < AUDIO_DURATION:
+              vid = random.choice(video_info)
+              sequence.append(vid)
+              total_duration += vid['duration']
+
+          print(f"\n🎲 Random sequence: {len(sequence)} clips, total {total_duration:.1f}s")
+
+          # Create concat file
+          with open('video_concat.txt', 'w') as f:
+              for vid in sequence:
+                  f.write(f"file '{vid['path']}'\n")
+
+          # Resolution scaling
+          scale_filter = ""
+          if RESOLUTION == "original":
+              scale_filter = ""
+          elif RESOLUTION == "1080":
+              scale_filter = "-vf scale=-2:1080"
+          elif RESOLUTION == "720":
+              scale_filter = "-vf scale=-2:720"
+          elif RESOLUTION == "480":
+              scale_filter = "-vf scale=-2:480"
+          elif RESOLUTION == "360":
+              scale_filter = "-vf scale=-2:360"
+          elif RESOLUTION == "240":
+              scale_filter = "-vf scale=-2:240"
+          elif RESOLUTION == "144":
+              scale_filter = "-vf scale=-2:144"
+
+          # Concatenate videos
+          print("\n🔗 Concatenating videos...")
+          concat_cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', 'video_concat.txt']
+          if scale_filter:
+              concat_cmd.extend(scale_filter.split())
+          concat_cmd.extend(['-c:v', 'libx264', '-preset', 'fast', '-t', str(AUDIO_DURATION), 'temp_video.mp4'])
+
+          subprocess.run(concat_cmd, check=True)
+
+          # Merge video with audio
+          print("🎵 Merging audio...")
+          subprocess.run([
+              'ffmpeg', '-y',
+              '-i', 'temp_video.mp4',
+              '-i', AUDIO_FILE,
+              '-c:v', 'copy',
+              '-c:a', 'aac',
+              '-map', '0:v:0',
+              '-map', '1:a:0',
+              '-shortest',
+              'output/final.mp4'
+          ], check=True)
+
+          # Check size
+          size_mb = os.path.getsize('output/final.mp4') / (1024 * 1024)
+          print(f"\n📦 Video size: {size_mb:.1f} MB")
+
+          # Compress if > 4.5GB (leave room for zip overhead)
+          if size_mb > 4500:
+              print("⚠️  Size > 4.5GB, compressing...")
+              subprocess.run([
+                  'ffmpeg', '-y',
+                  '-i', 'output/final.mp4',
+                  '-c:v', 'libx264',
+                  '-crf', '28',
+                  '-preset', 'fast',
+                  '-c:a', 'aac',
+                  '-b:a', '96k',
+                  'output/final_compressed.mp4'
+              ], check=True)
+              os.remove('output/final.mp4')
+              os.rename('output/final_compressed.mp4', 'output/final.mp4')
+              new_size = os.path.getsize('output/final.mp4') / (1024 * 1024)
+              print(f"✅ Compressed to {new_size:.1f} MB")
+
+          print("✅ Video generation complete")
+          EOF
+
+      - name: Rename output
+        run: |
           cd output
-          FILE=$(ls *.mp3 | head -n 1)
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          NOVEL="${{ github.event.inputs.novel_name }}"
+          if [ -z "$NOVEL" ]; then NOVEL="andrew-video"; fi
+          CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
+          mv final.mp4 "${CLEAN}_${TIMESTAMP}.mp4"
+          echo "OUTPUT_FILE=${CLEAN}_${TIMESTAMP}.mp4" >> $GITHUB_ENV
+
+      - name: Upload video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: output/${{ env.OUTPUT_FILE }}
+
+  publish:
+    name: Publish Release
+    needs: [init, merge, video-encode]
+    if: always() && needs.merge.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          cd artifacts
+
           TAG="tts-$(date +'%Y%m%d-%H%M%S')"
           TITLE="TTS — ${{ github.event.inputs.novel_name }}"
+          OUTPUT_TYPE="${{ github.event.inputs.output_type }}"
+
+          if [ "$OUTPUT_TYPE" = "video" ] && [ -d "final-video" ]; then
+            FILE=$(ls final-video/*.mp4 | head -n 1)
+            NOTES="🎬 Video generated in ${{ github.event.inputs.mode }} mode at ${{ github.event.inputs.resolution }}p"
+          else
+            FILE=$(ls final-audio/*.mp3 | head -n 1)
+            NOTES="🎵 Audio generated in ${{ github.event.inputs.mode }} mode"
+          fi
 
           gh release create "$TAG" "$FILE" \
             --repo hanshu1202/andrew-tts-audio \
             -t "$TITLE" \
-            -n "Generated in ${{ github.event.inputs.mode }} mode"
+            -n "$NOTES"
+
+          echo "✅ Published to andrew-tts-audio"
