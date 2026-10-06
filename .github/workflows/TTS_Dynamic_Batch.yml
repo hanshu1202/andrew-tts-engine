@@ -1,0 +1,245 @@
+name: Andrew TTS (Dynamic Batch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      text_input:
+        description: "Paste text (or leave blank to use input.txt)"
+        required: false
+        default: ""
+      novel_name:
+        description: "Novel name for output filename"
+        required: false
+        default: ""
+      mode:
+        description: "Mode: fast (max 20 workers) or balanced (max 10 workers)"
+        required: false
+        default: "fast"
+        type: choice
+        options:
+          - fast
+          - balanced
+
+jobs:
+  init:
+    name: Initialize
+    runs-on: ubuntu-latest
+    outputs:
+      total_chunks: ${{ steps.calc.outputs.total_chunks }}
+      worker_matrix: ${{ steps.calc.outputs.worker_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Calculate chunks and workers
+        id: calc
+        run: |
+          if [ -n "${{ github.event.inputs.text_input }}" ]; then
+            echo "${{ github.event.inputs.text_input }}" > input.txt
+          fi
+
+          CHARS=$(wc -m < input.txt)
+          TOTAL=$(( (CHARS + 4999) / 5000 ))
+          echo "total_chunks=$TOTAL" >> $GITHUB_OUTPUT
+
+          MODE="${{ github.event.inputs.mode }}"
+          if [ "$MODE" = "balanced" ]; then
+            MAX_WORKERS=10
+          else
+            MAX_WORKERS=20
+          fi
+
+          # Each worker handles ~5 chunks per batch, spawn enough workers
+          WORKERS=$(( (TOTAL + 4) / 5 ))
+          if [ $WORKERS -lt 6 ]; then WORKERS=6; fi
+          if [ $WORKERS -gt $MAX_WORKERS ]; then WORKERS=$MAX_WORKERS; fi
+
+          MATRIX=$(seq -s, 1 $WORKERS | sed 's/^/[/; s/$/]/')
+          echo "worker_matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+          echo "📊 Total: $CHARS chars → $TOTAL chunks"
+          echo "🏃 Mode: $MODE → spawning $WORKERS workers (max: $MAX_WORKERS)"
+
+          curl -s -X POST "${{ secrets.COORD_URL }}/reset?total=$TOTAL" \
+            -H "x-auth: ${{ secrets.COORD_SECRET }}"
+          echo "✅ Coordinator reset"
+
+  process:
+    name: Worker
+    needs: init
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        worker_id: ${{ fromJson(needs.init.outputs.worker_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install edge-tts requests -q
+      - name: Process chunks in batches
+        run: |
+          if [ -n "${{ github.event.inputs.text_input }}" ]; then
+            echo "${{ github.event.inputs.text_input }}" > input.txt
+          fi
+          mkdir -p chunks
+
+          python - <<'EOF'
+          import os, sys, time, requests, subprocess, asyncio
+
+          COORD_URL = "${{ secrets.COORD_URL }}"
+          COORD_SECRET = "${{ secrets.COORD_SECRET }}"
+          WORKER_ID = "${{ matrix.worker_id }}"
+          VOICE = "en-US-AndrewMultilingualNeural"
+          CHUNK_SIZE = 5000
+          BATCH_SIZE = 5
+          BATCH_PAUSE = 3
+
+          with open("input.txt", "r", encoding="utf-8") as f:
+              text = f.read().strip()
+          all_chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
+
+          def claim_batch():
+              try:
+                  r = requests.post(f"{COORD_URL}/claim-batch?count={BATCH_SIZE}",
+                                   headers={"x-auth": COORD_SECRET}, timeout=10)
+                  return r.json()
+              except Exception as e:
+                  print(f"❌ Claim error: {e}")
+                  return None
+
+          def mark_done_batch(chunks):
+              try:
+                  requests.post(f"{COORD_URL}/done-batch",
+                               headers={"x-auth": COORD_SECRET},
+                               json={"chunks": chunks}, timeout=10)
+              except Exception as e:
+                  print(f"❌ Mark done error: {e}")
+
+          def release_batch(chunks):
+              for c in chunks:
+                  try:
+                      requests.post(f"{COORD_URL}/release",
+                                   headers={"x-auth": COORD_SECRET},
+                                   json={"chunk": c}, timeout=10)
+                  except: pass
+
+          async def process_chunk(idx, chunk_text):
+              out_path = f"chunks/chunk_{str(idx).zfill(5)}.mp3"
+              for attempt in range(3):
+                  try:
+                      cmd = ["edge-tts", "--voice", VOICE, "--text", chunk_text, "--write-media", out_path]
+                      proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                      await proc.communicate()
+                      if proc.returncode == 0 and os.path.exists(out_path):
+                          return idx
+                  except Exception as e:
+                      print(f"  ❌ Chunk {idx} attempt {attempt+1} failed: {e}")
+                  await asyncio.sleep(2)
+              return None
+
+          async def main():
+              print(f"👷 Worker {WORKER_ID} starting...")
+              batch_count = 0
+
+              while True:
+                  claim = claim_batch()
+                  if not claim:
+                      await asyncio.sleep(2)
+                      continue
+
+                  if claim.get("done"):
+                      print("🏁 All chunks claimed!")
+                      break
+
+                  chunk_ids = claim.get("chunks", [])
+                  if not chunk_ids:
+                      await asyncio.sleep(2)
+                      continue
+
+                  batch_count += 1
+                  print(f"\n📦 Batch {batch_count}: claimed chunks {chunk_ids}")
+
+                  # Process all 5 chunks concurrently (like original TTS Main)
+                  tasks = [process_chunk(idx, all_chunks[idx]) for idx in chunk_ids if idx < len(all_chunks)]
+                  results = await asyncio.gather(*tasks)
+
+                  successful = [r for r in results if r is not None]
+                  failed = [chunk_ids[i] for i, r in enumerate(results) if r is None]
+
+                  if successful:
+                      mark_done_batch(successful)
+                      print(f"  ✅ Done: {len(successful)} chunks")
+
+                  if failed:
+                      release_batch(failed)
+                      print(f"  ⚠️  Released {len(failed)} failed chunks back to pool")
+
+                  # Microsoft rate-limit protection: pause between batches
+                  print(f"  ⏸️  Pausing {BATCH_PAUSE}s...")
+                  await asyncio.sleep(BATCH_PAUSE)
+
+          asyncio.run(main())
+          EOF
+
+      - name: Upload chunks
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunks-worker-${{ matrix.worker_id }}
+          path: chunks/*.mp3
+          retention-days: 1
+
+  merge:
+    name: Merge & Publish
+    needs: [init, process]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get install -y -q ffmpeg
+
+      - name: Download all chunks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chunks-worker-*
+          merge-multiple: true
+          path: output_chunks
+
+      - name: Merge chunks
+        run: |
+          mkdir -p output
+          cd output_chunks
+
+          for f in $(ls chunk_*.mp3 2>/dev/null | sort); do
+            echo "file '$PWD/$f'" >> ../filelist.txt
+          done
+
+          cd ..
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          NOVEL="${{ github.event.inputs.novel_name }}"
+          if [ -z "$NOVEL" ]; then NOVEL="andrew-audio"; fi
+          CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
+          OUTPUT="output/${CLEAN}_${TIMESTAMP}.mp3"
+
+          ffmpeg -y -f concat -safe 0 -i filelist.txt -c copy "$OUTPUT"
+          echo "OUTPUT_FILE=$OUTPUT" >> $GITHUB_ENV
+          echo "✅ Merged into $OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-audio
+          path: ${{ env.OUTPUT_FILE }}
+
+      - name: Create Release in andrew-tts-audio repo
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          cd output
+          FILE=$(ls *.mp3 | head -n 1)
+          TAG="tts-$(date +'%Y%m%d-%H%M%S')"
+          TITLE="TTS — ${{ github.event.inputs.novel_name }}"
+
+          gh release create "$TAG" "$FILE" \
+            --repo hanshu1202/andrew-tts-audio \
+            -t "$TITLE" \
+            -n "Generated in ${{ github.event.inputs.mode }} mode"
