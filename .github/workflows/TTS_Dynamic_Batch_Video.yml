@@ -1,0 +1,675 @@
+name: Andrew TTS (Dynamic Batch + Video)
+
+on:
+  workflow_dispatch:
+    inputs:
+      text_input:
+        description: "Paste text (or leave blank to use input.txt)"
+        required: false
+        default: ""
+      novel_name:
+        description: "Novel name for output filename"
+        required: false
+        default: ""
+      mode:
+        description: "Mode: fast (max 20 workers) or balanced (max 10 workers)"
+        required: false
+        default: "fast"
+        type: choice
+        options:
+          - fast
+          - balanced
+      output_type:
+        description: "Output: audio or video"
+        required: false
+        default: "audio"
+        type: choice
+        options:
+          - audio
+          - video
+      resolution:
+        description: "Video resolution (ignored if audio only)"
+        required: false
+        default: "720"
+        type: choice
+        options:
+          - original
+          - "1080"
+          - "720"
+          - "480"
+          - "360"
+          - "240"
+          - "144"
+
+jobs:
+  init:
+    name: Initialize
+    runs-on: ubuntu-latest
+    outputs:
+      total_chunks: ${{ steps.calc.outputs.total_chunks }}
+      worker_matrix: ${{ steps.calc.outputs.worker_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Calculate chunks and workers
+        id: calc
+        run: |
+          if [ -n "${{ github.event.inputs.text_input }}" ]; then
+            echo "${{ github.event.inputs.text_input }}" > input.txt
+          fi
+
+          CHARS=$(wc -m < input.txt)
+          TOTAL=$(( (CHARS + 4999) / 5000 ))
+          echo "total_chunks=$TOTAL" >> $GITHUB_OUTPUT
+
+          MODE="${{ github.event.inputs.mode }}"
+          if [ "$MODE" = "balanced" ]; then
+            MAX_WORKERS=10
+          else
+            MAX_WORKERS=20
+          fi
+
+          WORKERS=$(( (TOTAL + 4) / 5 ))
+          if [ $WORKERS -lt 6 ]; then WORKERS=6; fi
+          if [ $WORKERS -gt $MAX_WORKERS ]; then WORKERS=$MAX_WORKERS; fi
+
+          MATRIX=$(seq -s, 1 $WORKERS | sed 's/^/[/; s/$/]/')
+          echo "worker_matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+          echo "📊 Total: $CHARS chars → $TOTAL chunks"
+          echo "🏃 Mode: $MODE → spawning $WORKERS workers (max: $MAX_WORKERS)"
+          echo "🎬 Output: ${{ github.event.inputs.output_type }}"
+
+          curl -s -X POST "${{ secrets.COORD_URL }}/reset?total=$TOTAL" \
+            -H "x-auth: ${{ secrets.COORD_SECRET }}"
+          echo "✅ Coordinator reset"
+
+  process:
+    name: Worker
+    needs: init
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        worker_id: ${{ fromJson(needs.init.outputs.worker_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install edge-tts requests -q
+      - name: Process chunks in batches
+        run: |
+          if [ -n "${{ github.event.inputs.text_input }}" ]; then
+            echo "${{ github.event.inputs.text_input }}" > input.txt
+          fi
+          mkdir -p chunks
+
+          python - <<'EOF'
+          import os, sys, time, requests, subprocess, asyncio
+
+          COORD_URL = "${{ secrets.COORD_URL }}"
+          COORD_SECRET = "${{ secrets.COORD_SECRET }}"
+          WORKER_ID = "${{ matrix.worker_id }}"
+          VOICE = "en-US-AndrewMultilingualNeural"
+          CHUNK_SIZE = 5000
+          BATCH_SIZE = 5
+          BATCH_PAUSE = 3
+
+          with open("input.txt", "r", encoding="utf-8") as f:
+              text = f.read().strip()
+          all_chunks = [text[i:i+CHUNK_SIZE] for i in range(0, len(text), CHUNK_SIZE)]
+
+          def claim_batch():
+              try:
+                  r = requests.post(f"{COORD_URL}/claim-batch?count={BATCH_SIZE}",
+                                   headers={"x-auth": COORD_SECRET}, timeout=10)
+                  return r.json()
+              except Exception as e:
+                  print(f"❌ Claim error: {e}")
+                  return None
+
+          def mark_done_batch(chunks):
+              try:
+                  requests.post(f"{COORD_URL}/done-batch",
+                               headers={"x-auth": COORD_SECRET},
+                               json={"chunks": chunks}, timeout=10)
+              except Exception as e:
+                  print(f"❌ Mark done error: {e}")
+
+          def release_batch(chunks):
+              for c in chunks:
+                  try:
+                      requests.post(f"{COORD_URL}/release",
+                                   headers={"x-auth": COORD_SECRET},
+                                   json={"chunk": c}, timeout=10)
+                  except: pass
+
+          async def process_chunk(idx, chunk_text):
+              out_path = f"chunks/chunk_{str(idx).zfill(5)}.mp3"
+              for attempt in range(3):
+                  try:
+                      cmd = ["edge-tts", "--voice", VOICE, "--text", chunk_text, "--write-media", out_path]
+                      proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                      await proc.communicate()
+                      if proc.returncode == 0 and os.path.exists(out_path):
+                          return idx
+                  except Exception as e:
+                      print(f"  ❌ Chunk {idx} attempt {attempt+1} failed: {e}")
+                  await asyncio.sleep(2)
+              return None
+
+          async def main():
+              print(f"👷 Worker {WORKER_ID} starting...")
+              batch_count = 0
+
+              while True:
+                  claim = claim_batch()
+                  if not claim:
+                      await asyncio.sleep(2)
+                      continue
+
+                  if claim.get("done"):
+                      print("🏁 All chunks claimed!")
+                      break
+
+                  chunk_ids = claim.get("chunks", [])
+                  if not chunk_ids:
+                      await asyncio.sleep(2)
+                      continue
+
+                  batch_count += 1
+                  print(f"\n📦 Batch {batch_count}: claimed chunks {chunk_ids}")
+
+                  tasks = [process_chunk(idx, all_chunks[idx]) for idx in chunk_ids if idx < len(all_chunks)]
+                  results = await asyncio.gather(*tasks)
+
+                  successful = [r for r in results if r is not None]
+                  failed = [chunk_ids[i] for i, r in enumerate(results) if r is None]
+
+                  if successful:
+                      mark_done_batch(successful)
+                      print(f"  ✅ Done: {len(successful)} chunks")
+
+                  if failed:
+                      release_batch(failed)
+                      print(f"  ⚠️  Released {len(failed)} failed chunks back to pool")
+
+                  print(f"  ⏸️  Pausing {BATCH_PAUSE}s...")
+                  await asyncio.sleep(BATCH_PAUSE)
+
+          asyncio.run(main())
+          EOF
+
+      - name: Upload chunks
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunks-worker-${{ matrix.worker_id }}
+          path: chunks/*.mp3
+          retention-days: 1
+
+  merge:
+    name: Merge Audio
+    needs: [init, process]
+    runs-on: ubuntu-latest
+    outputs:
+      audio_file: ${{ steps.merge.outputs.audio_file }}
+      audio_duration: ${{ steps.merge.outputs.audio_duration }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get install -y -q ffmpeg
+
+      - name: Download all chunks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chunks-worker-*
+          merge-multiple: true
+          path: output_chunks
+
+      - name: Merge chunks
+        id: merge
+        run: |
+          mkdir -p output
+          cd output_chunks
+
+          for f in $(ls chunk_*.mp3 2>/dev/null | sort); do
+            echo "file '$PWD/$f'" >> ../filelist.txt
+          done
+
+          cd ..
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          NOVEL="${{ github.event.inputs.novel_name }}"
+          if [ -z "$NOVEL" ]; then NOVEL="andrew-audio"; fi
+          CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
+          OUTPUT="output/${CLEAN}_${TIMESTAMP}.mp3"
+
+          ffmpeg -y -f concat -safe 0 -i filelist.txt -c copy "$OUTPUT"
+
+          # Get audio duration
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT")
+
+          echo "audio_file=$OUTPUT" >> $GITHUB_OUTPUT
+          echo "audio_duration=$DURATION" >> $GITHUB_OUTPUT
+          echo "✅ Merged into $OUTPUT (${DURATION}s)"
+
+      - name: Upload audio artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-audio
+          path: ${{ steps.merge.outputs.audio_file }}
+
+  video-encode:
+    name: Create Video
+    needs: [init, merge]
+    if: github.event.inputs.output_type == 'video'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get install -y -q ffmpeg
+
+      - name: Download source videos from Release
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          mkdir -p source_videos
+          # Download all assets from the 'source-videos' release
+          gh release download source-videos --repo hanshu1202/andrew-tts-engine --dir source_videos
+
+          if [ -z "$(ls -A source_videos 2>/dev/null)" ]; then
+            echo "⚠️  No source videos found in 'source-videos' release"
+            echo "Please create a release named 'source-videos' in the engine repo and upload your MP4s"
+            exit 1
+          fi
+          echo "✅ Downloaded source videos:"
+          ls -lh source_videos/
+
+      - name: Download audio
+        uses: actions/download-artifact@v4
+        with:
+          name: final-audio
+          path: audio
+
+      - name: Generate video
+        run: |
+          mkdir -p output
+
+          python - <<'EOF'
+          import os, sys, subprocess, random, json
+
+          AUDIO_DURATION = float("${{ needs.merge.outputs.audio_duration }}")
+          RESOLUTION = "${{ github.event.inputs.resolution }}"
+          audio_files = [os.path.join('audio', f) for f in os.listdir('audio') if f.endswith('.mp3')]
+          if not audio_files:
+              print("❌ No audio file found")
+              sys.exit(1)
+          AUDIO_FILE = audio_files[0]
+
+          # Get all source videos
+          video_dir = "source_videos"
+          videos = [os.path.join(video_dir, f) for f in os.listdir(video_dir)
+                   if f.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm'))]
+
+          if not videos:
+              print("❌ No video files found")
+              sys.exit(1)
+
+          print(f"🎬 Found {len(videos)} source videos")
+          print(f"🎵 Audio duration: {AUDIO_DURATION}s")
+          print(f"📐 Resolution: {RESOLUTION}")
+
+          # Get duration of each video
+          video_info = []
+          for v in videos:
+              try:
+                  result = subprocess.run(
+                      ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                       '-of', 'default=noprint_wrappers=1:nokey=1', v],
+                      capture_output=True, text=True, timeout=10
+                  )
+                  duration = float(result.stdout.strip())
+                  video_info.append({'path': v, 'duration': duration})
+                  print(f"  📹 {os.path.basename(v)}: {duration:.1f}s")
+              except Exception as e:
+                  print(f"  ⚠️  Skipping {v}: {e}")
+
+          # Build video sequence by randomly picking videos until we match audio duration
+          sequence = []
+          total_duration = 0.0
+
+          while total_duration < AUDIO_DURATION:
+              vid = random.choice(video_info)
+              sequence.append(vid)
+              total_duration += vid['duration']
+
+          print(f"\n🎲 Random sequence: {len(sequence)} clips, total {total_duration:.1f}s")
+
+          # Create concat file
+          with open('video_concat.txt', 'w') as f:
+              for vid in sequence:
+                  f.write(f"file '{vid['path']}'\n")
+
+          # Resolution scaling
+          scale_filter = ""
+          if RESOLUTION == "original":
+              scale_filter = ""
+          elif RESOLUTION == "1080":
+              scale_filter = "-vf scale=-2:1080"
+          elif RESOLUTION == "720":
+              scale_filter = "-vf scale=-2:720"
+          elif RESOLUTION == "480":
+              scale_filter = "-vf scale=-2:480"
+          elif RESOLUTION == "360":
+              scale_filter = "-vf scale=-2:360"
+          elif RESOLUTION == "240":
+              scale_filter = "-vf scale=-2:240"
+          elif RESOLUTION == "144":
+              scale_filter = "-vf scale=-2:144"
+
+          # Concatenate videos
+          print("\n🔗 Concatenating videos...")
+          concat_cmd = ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', 'video_concat.txt']
+          if scale_filter:
+              concat_cmd.extend(scale_filter.split())
+          concat_cmd.extend(['-c:v', 'libx264', '-preset', 'fast', '-t', str(AUDIO_DURATION), 'temp_video.mp4'])
+
+          subprocess.run(concat_cmd, check=True)
+
+          # Merge video with audio
+          print("🎵 Merging audio...")
+          subprocess.run([
+              'ffmpeg', '-y',
+              '-i', 'temp_video.mp4',
+              '-i', AUDIO_FILE,
+              '-c:v', 'copy',
+              '-c:a', 'aac',
+              '-map', '0:v:0',
+              '-map', '1:a:0',
+              '-shortest',
+              'output/final.mp4'
+          ], check=True)
+
+          # Check size
+          size_mb = os.path.getsize('output/final.mp4') / (1024 * 1024)
+          print(f"\n📦 Video size: {size_mb:.1f} MB")
+
+          # Compress if > 1.8GB (leave room for zip overhead to stay under 2GB)
+          if size_mb > 1800:
+              print("⚠️  Size > 1.8GB, compressing...")
+              subprocess.run([
+                  'ffmpeg', '-y',
+                  '-i', 'output/final.mp4',
+                  '-c:v', 'libx264',
+                  '-crf', '28',
+                  '-preset', 'fast',
+                  '-c:a', 'aac',
+                  '-b:a', '96k',
+                  'output/final_compressed.mp4'
+              ], check=True)
+              os.remove('output/final.mp4')
+              os.rename('output/final_compressed.mp4', 'output/final.mp4')
+              new_size = os.path.getsize('output/final.mp4') / (1024 * 1024)
+              print(f"✅ Compressed to {new_size:.1f} MB")
+
+          print("✅ Video generation complete")
+          EOF
+
+      - name: Download all chunks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chunks-worker-*
+          merge-multiple: true
+          path: output_chunks
+
+      - name: Generate subtitles (parallel with video encoding)
+        run: |
+          if [ -n "${{ github.event.inputs.text_input }}" ]; then
+            echo "${{ github.event.inputs.text_input }}" > input.txt
+          fi
+          pip install edge-tts pydub -q
+          mkdir -p srt
+
+          cat > /tmp/gen_srt.py << 'PYEOF'
+import asyncio, os, time, sys, re
+import edge_tts
+
+VOICE = "en-US-AndrewMultilingualNeural"
+OUTPUT_SRT = "srt/subtitles.srt"
+OUTPUT_DIR = "output_chunks"
+INPUT_FILE = "input.txt"
+WORDS_PER_LINE = 8
+LINES_PER_ENTRY = 2
+CONCURRENCY = 8
+MAX_RETRIES = 3
+GAP_MS = 0
+AVG_MS_PER_WORD = 350
+
+def fmt_time(ms):
+    ms = max(0, int(ms))
+    h = ms // 3_600_000; ms -= h * 3_600_000
+    m = ms // 60_000; ms -= m * 60_000
+    s = ms // 1_000; ms -= s * 1_000
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def get_real_duration_ms(file_path):
+    if not os.path.exists(file_path):
+        return None
+    try:
+        from pydub import AudioSegment
+        return len(AudioSegment.from_file(file_path))
+    except Exception:
+        return None
+
+async def collect_sentence_events(text, semaphore, idx):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with semaphore:
+                sentence_events = []
+                current_sentence_words = []
+                current_sentence_data = None
+                communicate = edge_tts.Communicate(text, VOICE)
+                async for item in communicate.stream():
+                    if item.get("type") == "SentenceBoundary":
+                        if current_sentence_data:
+                            current_sentence_data["word_events"] = current_sentence_words
+                            sentence_events.append(current_sentence_data)
+                            current_sentence_words = []
+                        current_sentence_data = {
+                            "offset_ms": item["offset"] // 10_000,
+                            "duration_ms": item["duration"] // 10_000,
+                            "tts_text": item.get("text", "").strip(),
+                            "word_events": []
+                        }
+                    elif item.get("type") == "WordBoundary" and current_sentence_data:
+                        current_sentence_words.append({
+                            "offset_ms": item["offset"] // 10_000,
+                            "duration_ms": item["duration"] // 10_000,
+                            "text": item.get("text", "").strip()
+                        })
+                if current_sentence_data:
+                    current_sentence_data["word_events"] = current_sentence_words
+                    sentence_events.append(current_sentence_data)
+                return (idx, sentence_events, text)
+        except Exception as e:
+            if attempt == MAX_RETRIES:
+                print(f"  Warning: Chunk {idx+1} failed: {e}")
+                return (idx, [], text)
+            await asyncio.sleep(2 ** attempt)
+
+def slice_original_words(chunk_text, tts_sentences):
+    original_words = chunk_text.split()
+    sentence_word_counts = [len(s.split()) for s in tts_sentences]
+    total_tts_words = sum(sentence_word_counts)
+    if total_tts_words == 0 or total_tts_words != len(original_words):
+        return [s.split() for s in tts_sentences]
+    sliced = []
+    cursor = 0
+    for count in sentence_word_counts:
+        sliced.append(original_words[cursor: cursor + count])
+        cursor += count
+    return sliced
+
+async def main():
+    t0 = time.time()
+    test_comm = edge_tts.Communicate("Hello world. This is a test.", VOICE)
+    test_evts = [i async for i in test_comm.stream() if i.get("type") == "SentenceBoundary"]
+    if test_evts:
+        print("  SentenceBoundary working")
+    else:
+        print("  ERROR: No SentenceBoundary events")
+        return
+
+    print("  Reading chunks...")
+    chunks = []
+    if not os.path.exists(OUTPUT_DIR):
+        print(f"  ERROR: Directory {OUTPUT_DIR} not found")
+        return
+    for f in sorted(os.listdir(OUTPUT_DIR)):
+        if f.startswith("chunk_") and f.endswith(".mp3"):
+            idx = int(f.split("_")[1].split(".")[0])
+            if not os.path.exists(INPUT_FILE):
+                print(f"  ERROR: {INPUT_FILE} not found")
+                return
+            with open(INPUT_FILE, "r", encoding="utf-8") as fh:
+                chunks.append((idx, fh.read()))
+    chunks.sort(key=lambda x: x[0])
+
+    if not chunks:
+        print("  ERROR: No chunk files found")
+        return
+
+    total = len(chunks)
+    semaphore = asyncio.Semaphore(CONCURRENCY)
+    done = 0
+    failed = 0
+    results = []
+
+    async def tracked(chunk, i):
+        nonlocal done, failed
+        idx, text = chunk
+        result = await collect_sentence_events(text, semaphore, idx)
+        done += 1
+        if not result[1]:
+            failed += 1
+        pct = done / total
+        bar_len = 20
+        filled = int(bar_len * pct)
+        bar = "#" * filled + "." * (bar_len - filled)
+        sys.stdout.write(f"\r  [{bar}] {done}/{total}  {pct*100:.1f}%")
+        sys.stdout.flush()
+        results.append(result)
+        return result
+
+    tasks = [tracked(chunk, i) for i, chunk in enumerate(chunks)]
+    await asyncio.gather(*tasks)
+    print()
+    results.sort(key=lambda x: x[0])
+
+    entries = []
+    entry_id = 1
+    clock_ms = 0.0
+    words_per_entry_max = WORDS_PER_LINE * LINES_PER_ENTRY
+    for (idx, chunk_text), evts, text in results:
+        real_file = f"{OUTPUT_DIR}/chunk_{idx:05d}.mp3"
+        real_duration_ms = get_real_duration_ms(real_file)
+        if real_duration_ms is None:
+            print(f"  Warning: Chunk {idx}: missing - using estimate")
+            real_duration_ms = max(len(chunk_text.split()) * AVG_MS_PER_WORD, 500)
+        if not evts:
+            clock_ms += real_duration_ms + GAP_MS
+            continue
+        stream_total_ms = evts[-1]["offset_ms"] + evts[-1]["duration_ms"]
+        scale = (real_duration_ms / stream_total_ms) if stream_total_ms > 0 else 1.0
+        sentence_word_lists = slice_original_words(chunk_text, [e["tts_text"] for e in evts])
+        for e, word_list in zip(evts, sentence_word_lists):
+            if not word_list:
+                continue
+            s_start = clock_ms + e["offset_ms"] * scale
+            s_end = clock_ms + (e["offset_ms"] + e["duration_ms"]) * scale
+            s_dur = max(s_end - s_start, 1.0)
+            i = 0
+            while i < len(word_list):
+                group = word_list[i: i + words_per_entry_max]
+                frac_start = i / len(word_list)
+                frac_end = min((i + len(group)) / len(word_list), 1.0)
+                group_start = s_start + frac_start * s_dur
+                group_end = s_start + frac_end * s_dur
+                lines = []
+                for ln in range(0, len(group), WORDS_PER_LINE):
+                    lines.append(" ".join(group[ln: ln + WORDS_PER_LINE]))
+                entries.append(
+                    f"{entry_id}\n{fmt_time(group_start)} --> {fmt_time(group_end)}\n"
+                    + "\n".join(lines) + "\n"
+                )
+                entry_id += 1
+                i += len(group)
+        clock_ms += real_duration_ms + GAP_MS
+
+    with open(OUTPUT_SRT, "w", encoding="utf-8") as f:
+        f.write("\n".join(entries))
+    elapsed = time.time() - t0
+    n_entries = len(entries)
+    print(f"  Done in {elapsed:.1f}s | {n_entries} entries")
+    if failed:
+        print(f"  Warning: {failed} chunks used estimates")
+
+asyncio.run(main())
+PYEOF
+          python3 /tmp/gen_srt.py
+
+      - name: Embed subtitles into video (fast mux)
+        run: |
+          mkdir -p output
+          ffmpeg -y -i output/final.mp4 -i srt/subtitles.srt -c copy -c:s mov_text output/subtitled.mp4
+
+      - name: Rename output
+        run: |
+          cd output
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          NOVEL="${{ github.event.inputs.novel_name }}"
+          if [ -z "$NOVEL" ]; then NOVEL="andrew-video"; fi
+          CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
+          mv final.mp4 "${CLEAN}_${TIMESTAMP}.mp4"
+          echo "OUTPUT_FILE=${CLEAN}_${TIMESTAMP}.mp4" >> $GITHUB_ENV
+
+      - name: Upload video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: output/${{ env.OUTPUT_FILE }}
+
+  publish:
+    name: Publish Release
+    needs: [init, merge, video-encode]
+    if: always() && needs.merge.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          cd artifacts
+
+          TAG="tts-$(date +'%Y%m%d-%H%M%S')"
+          TITLE="TTS — ${{ github.event.inputs.novel_name }}"
+          OUTPUT_TYPE="${{ github.event.inputs.output_type }}"
+
+          if [ "$OUTPUT_TYPE" = "video" ] && [ -d "final-video" ]; then
+            FILE=$(ls final-video/*.mp4 | head -n 1)
+            NOTES="🎬 Video generated in ${{ github.event.inputs.mode }} mode at ${{ github.event.inputs.resolution }}p"
+          else
+            FILE=$(ls final-audio/*.mp3 | head -n 1)
+            NOTES="🎵 Audio generated in ${{ github.event.inputs.mode }} mode"
+          fi
+
+          gh release create "$TAG" "$FILE" \
+            --repo hanshu1202/andrew-tts-audio \
+            -t "$TITLE" \
+            -n "$NOTES"
+
+          echo "✅ Published to andrew-tts-audio"
