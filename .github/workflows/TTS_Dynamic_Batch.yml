@@ -277,10 +277,10 @@ jobs:
 
           # Check for split files and merge them
           echo "Checking for split video files..."
-          for f in $(ls source_videos/*.part* 2>/dev/null | cut -d. -f1 | uniq); do
+          for f in $(ls source_videos/*.part* 2>/dev/null | sed 's/\.part[0-9]*$//' | uniq); do
             echo "Merging parts for $f..."
-            cat "$f".part* > "${f%.*}.mp4"
-            echo "✅ Merged ${f%.*}.mp4"
+            cat "$f".part* > "${f}.mp4"
+            echo "✅ Merged ${f}.mp4"
           done
 
           if [ ! -d "source_videos" ] || [ -z "$(ls -A source_videos 2>/dev/null)" ]; then
