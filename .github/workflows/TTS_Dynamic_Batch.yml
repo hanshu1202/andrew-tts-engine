@@ -1,0 +1,266 @@
+name: Andrew TTS (Dynamic Batch + Video)
+
+on:
+  workflow_dispatch:
+    inputs:
+      text_input:
+        description: "Paste text (or leave blank to use input.txt)"
+        required: false
+        default: ""
+      novel_name:
+        description: "Novel name for output filename"
+        required: false
+        default: ""
+      mode:
+        description: "Mode: fast (max 20 workers) or balanced (max 10 workers)"
+        required: false
+        default: "fast"
+        type: choice
+        options:
+          - fast
+          - balanced
+      output_type:
+        description: "Output: audio or video"
+        required: false
+        default: "audio"
+        type: choice
+        options:
+          - audio
+          - video
+      resolution:
+        description: "Video resolution (ignored if audio only)"
+        required: false
+        default: "720"
+        type: choice
+        options:
+          - original
+          - "1080"
+          - "720"
+          - "480"
+          - "360"
+          - "240"
+          - "144"
+
+jobs:
+  init:
+    name: Initialize
+    runs-on: ubuntu-latest
+    outputs:
+      total_chunks: ${{ steps.calc.outputs.total_chunks }}
+      worker_matrix: ${{ steps.calc.outputs.worker_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Calculate chunks and workers
+        id: calc
+        run: |
+          if [ -n "${{ github.event.inputs.text_input }}" ]; then
+            echo "${{ github.event.inputs.text_input }}" > input.txt
+          fi
+
+          CHARS=$(wc -m < input.txt)
+          TOTAL=$(( (CHARS + 4999) / 5000 ))
+          echo "total_chunks=$TOTAL" >> $GITHUB_OUTPUT
+
+          MODE="${{ github.event.inputs.mode }}"
+          if [ "$MODE" = "balanced" ]; then
+            MAX_WORKERS=10
+          else
+            MAX_WORKERS=20
+          fi
+
+          WORKERS=$(( (TOTAL + 4) / 5 ))
+          if [ $WORKERS -lt 6 ]; then WORKERS=6; fi
+          if [ $WORKERS -gt $MAX_WORKERS ]; then WORKERS=$MAX_WORKERS; fi
+
+          MATRIX=$(seq -s, 1 $WORKERS | sed 's/^/[/; s/$/]/')
+          echo "worker_matrix=$MATRIX" >> $GITHUB_OUTPUT
+
+          echo "📊 Total: $CHARS chars → $TOTAL chunks"
+          echo "🏃 Mode: $MODE → spawning $WORKERS workers (max: $MAX_WORKERS)"
+          echo "🎬 Output: ${{ github.event.inputs.output_type }}"
+
+          curl -s -X POST "${{ secrets.COORD_URL }}/reset?total=$TOTAL" \
+            -H "x-auth: ${{ secrets.COORD_SECRET }}"
+          echo "✅ Coordinator reset"
+
+  process:
+    name: Worker
+    needs: init
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        worker_id: ${{ fromJson(needs.init.outputs.worker_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install edge-tts requests -q
+      - name: Process chunks in batches
+        env:
+          COORD_URL: ${{ secrets.COORD_URL }}
+          COORD_SECRET: ${{ secrets.COORD_SECRET }}
+          WORKER_ID: ${{ matrix.worker_id }}
+        run: |
+          if [ -n "${{ github.event.inputs.text_input }}" ]; then
+            echo "${{ github.event.inputs.text_input }}" > input.txt
+          fi
+          mkdir -p chunks
+          python3 .github/scripts/process_chunks.py
+
+      - name: Upload chunks
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunks-worker-${{ matrix.worker_id }}
+          path: chunks/*.mp3
+          retention-days: 1
+
+  merge:
+    name: Merge Audio
+    needs: [init, process]
+    runs-on: ubuntu-latest
+    outputs:
+      audio_file: ${{ steps.merge.outputs.audio_file }}
+      audio_duration: ${{ steps.merge.outputs.audio_duration }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get install -y -q ffmpeg
+
+      - name: Download all chunks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chunks-worker-*
+          merge-multiple: true
+          path: output_chunks
+
+      - name: Merge chunks
+        id: merge
+        run: |
+          mkdir -p output
+          cd output_chunks
+          for f in $(ls chunk_*.mp3 2>/dev/null | sort); do
+            echo "file '$PWD/$f'" >> ../filelist.txt
+          done
+          cd ..
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          NOVEL="${{ github.event.inputs.novel_name }}"
+          if [ -z "$NOVEL" ]; then NOVEL="andrew-audio"; fi
+          CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
+          OUTPUT="output/${CLEAN}_${TIMESTAMP}.mp3"
+          ffmpeg -y -f concat -safe 0 -i filelist.txt -c copy "$OUTPUT"
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT")
+          echo "audio_file=$OUTPUT" >> $GITHUB_OUTPUT
+          echo "audio_duration=$DURATION" >> $GITHUB_OUTPUT
+          echo "✅ Merged into $OUTPUT (${DURATION}s)"
+
+      - name: Upload audio artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-audio
+          path: ${{ steps.merge.outputs.audio_file }}
+
+  video-encode:
+    name: Create Video
+    needs: [init, merge]
+    if: github.event.inputs.output_type == 'video'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ffmpeg
+        run: sudo apt-get install -y -q ffmpeg
+
+      - name: Download source videos from Release
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          mkdir -p source_videos
+          gh release download source-videos --repo hanshu1202/andrew-tts-engine --dir source_videos
+          if [ -z "$(ls -A source_videos 2>/dev/null)" ]; then
+            echo "⚠️  No source videos found"
+            exit 1
+          fi
+
+      - name: Download audio
+        uses: actions/download-artifact@v4
+        with:
+          name: final-audio
+          path: audio
+
+      - name: Generate video
+        env:
+          AUDIO_DURATION: ${{ needs.merge.outputs.audio_duration }}
+          RESOLUTION: ${{ github.event.inputs.resolution }}
+        run: |
+          mkdir -p output
+          python3 .github/scripts/generate_video.py
+
+      - name: Download all chunks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chunks-worker-*
+          merge-multiple: true
+          path: output_chunks
+
+      - name: Generate subtitles (parallel with video encoding)
+        run: |
+          if [ -n "${{ github.event.inputs.text_input }}" ]; then
+            echo "${{ github.event.inputs.text_input }}" > input.txt
+          fi
+          pip install edge-tts pydub -q
+          mkdir -p srt
+          python3 .github/scripts/generate_srt.py
+
+      - name: Embed subtitles into video (fast mux)
+        run: |
+          mkdir -p output
+          ffmpeg -y -i output/final.mp4 -i srt/subtitles.srt -c copy -c:s mov_text output/subtitled.mp4
+
+      - name: Rename output
+        run: |
+          cd output
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+          NOVEL="${{ github.event.inputs.novel_name }}"
+          if [ -z "$NOVEL" ]; then NOVEL="andrew-video"; fi
+          CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
+          mv subtitled.mp4 "${CLEAN}_${TIMESTAMP}.mp4"
+          echo "OUTPUT_FILE=${CLEAN}_${TIMESTAMP}.mp4" >> $GITHUB_ENV
+
+      - name: Upload video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: output/${{ env.OUTPUT_FILE }}
+
+  publish:
+    name: Publish Release
+    needs: [init, merge, video-encode]
+    if: always() && needs.merge.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          cd artifacts
+          TAG="tts-$(date +'%Y%m%d-%H%M%S')"
+          TITLE="TTS — ${{ github.event.inputs.novel_name }}"
+          OUTPUT_TYPE="${{ github.event.inputs.output_type }}"
+          if [ "$OUTPUT_TYPE" = "video" ] && [ -d "final-video" ]; then
+            FILE=$(ls final-video/*.mp4 | head -n 1)
+            NOTES="🎬 Video generated in ${{ github.event.inputs.mode }} mode at ${{ github.event.inputs.resolution }}p"
+          else
+            FILE=$(ls final-audio/*.mp3 | head -n 1)
+            NOTES="🎵 Audio generated in ${{ github.event.inputs.mode }} mode"
+          fi
+          gh release create "$TAG" "$FILE" \
+            --repo hanshu1202/andrew-tts-audio \
+            -t "$TITLE" \
+            -n "$NOTES"
+          echo "✅ Published to andrew-tts-audio"
