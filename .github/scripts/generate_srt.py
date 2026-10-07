@@ -11,6 +11,7 @@ CONCURRENCY = 8
 MAX_RETRIES = 3
 GAP_MS = 0
 AVG_MS_PER_WORD = 350
+YELLOW = "#FFFF00"
 
 def fmt_time(ms):
     ms = max(0, int(ms))
@@ -79,6 +80,9 @@ def slice_original_words(chunk_text, tts_sentences):
 
 async def main():
     t0 = time.time()
+    # Handle plain SRT for burn-in mode
+    srt_plain = os.environ.get("SRT_PLAIN") == "1"
+
     test_comm = edge_tts.Communicate("Hello world. This is a test.", VOICE)
     test_evts = [i async for i in test_comm.stream() if i.get("type") == "SentenceBoundary"]
     if test_evts:
@@ -174,7 +178,12 @@ async def main():
                 group_end = s_start + frac_end * s_dur
                 lines = []
                 for ln in range(0, len(group), WORDS_PER_LINE):
-                    lines.append(" ".join(group[ln: ln + WORDS_PER_LINE]))
+                    line_text = " ".join(group[ln: ln + WORDS_PER_LINE])
+                    line_text = line_text.replace("<", "&lt;").replace(">", "&gt;")
+                    if srt_plain:
+                        lines.append(line_text)
+                    else:
+                        lines.append(f'<font color="{YELLOW}">{line_text}</font>')
                 entries.append(
                     f"{entry_id}\n{fmt_time(group_start)} --> {fmt_time(group_end)}\n"
                     + "\n".join(lines) + "\n"

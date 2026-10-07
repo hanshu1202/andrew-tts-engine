@@ -40,6 +40,14 @@ on:
           - "360"
           - "240"
           - "144"
+      subtitle_mode:
+        description: "soft = fast, yellow via tags (player must support color); burn = baked into video (works everywhere, slower)"
+        required: false
+        default: "soft"
+        type: choice
+        options:
+          - soft
+          - burn
 
 jobs:
   init:
