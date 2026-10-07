@@ -87,7 +87,16 @@ async def main():
         print("  ERROR: No SentenceBoundary events")
         return
 
-    print("  Reading chunks...")
+    print("  Reading input text and chunks...")
+    if not os.path.exists(INPUT_FILE):
+        print(f"  ERROR: {INPUT_FILE} not found")
+        return
+    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+        full_text = f.read().strip()
+
+    # Slice text into 5000-char chunks matching the process job
+    all_chunks_text = [full_text[i:i+5000] for i in range(0, len(full_text), 5000)]
+
     chunks = []
     if not os.path.exists(OUTPUT_DIR):
         print(f"  ERROR: Directory {OUTPUT_DIR} not found")
@@ -95,11 +104,10 @@ async def main():
     for f in sorted(os.listdir(OUTPUT_DIR)):
         if f.startswith("chunk_") and f.endswith(".mp3"):
             idx = int(f.split("_")[1].split(".")[0])
-            if not os.path.exists(INPUT_FILE):
-                print(f"  ERROR: {INPUT_FILE} not found")
-                return
-            with open(INPUT_FILE, "r", encoding="utf-8") as fh:
-                chunks.append((idx, fh.read()))
+            if idx < len(all_chunks_text):
+                chunks.append((idx, all_chunks_text[idx]))
+            else:
+                print(f"  Warning: Chunk index {idx} out of range for input text")
     chunks.sort(key=lambda x: x[0])
 
     if not chunks:
