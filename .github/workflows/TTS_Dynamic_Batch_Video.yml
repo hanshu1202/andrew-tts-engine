@@ -198,7 +198,7 @@ jobs:
                   await asyncio.sleep(BATCH_PAUSE)
 
           asyncio.run(main())
-          EOF
+EOF
 
       - name: Upload chunks
         uses: actions/upload-artifact@v4
@@ -412,7 +412,7 @@ jobs:
               print(f"✅ Compressed to {new_size:.1f} MB")
 
           print("✅ Video generation complete")
-          EOF
+EOF
 
       - name: Download all chunks
         uses: actions/download-artifact@v4
