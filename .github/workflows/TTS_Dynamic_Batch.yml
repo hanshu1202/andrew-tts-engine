@@ -166,7 +166,6 @@ jobs:
     needs: [init, merge]
     if: github.event.inputs.output_type == 'video'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install ffmpeg
