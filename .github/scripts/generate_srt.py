@@ -141,11 +141,13 @@ async def main():
     print()
     results.sort(key=lambda x: x[0])
 
+    chunks_by_idx = dict(chunks)
     entries = []
     entry_id = 1
     clock_ms = 0.0
     words_per_entry_max = WORDS_PER_LINE * LINES_PER_ENTRY
-    for (idx, chunk_text), evts, text in results:
+    for idx, evts, text in results:
+        chunk_text = chunks_by_idx[idx]
         real_file = f"{OUTPUT_DIR}/chunk_{idx:05d}.mp3"
         real_duration_ms = get_real_duration_ms(real_file)
         if real_duration_ms is None:
