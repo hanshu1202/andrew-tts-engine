@@ -1,18 +1,9 @@
-(Rating just opened, will rise later) [Game Arrival + Chinese Mythology + Genius Academy + Leveling Up + Protective Support]
-The game "Gods Descend" has come to life, reviving global mythology.
-The starting dungeon for beginners is "Havoc in Heaven".
-All the players confidently declared: "With 100,000 to 1, the advantage is on our side. We've got Heavenly Court as our pick this time!"
-"There's only one right across from us! Only an idiot would choose that!"
-Jiang Li, who transmigrated here: "?"
-Do the people here not know Chinese mythology?
-She was deeply shocked and resolutely chose the Great Sage's camp.
-What? This is none other than the Monkey King, Sun Wukong!
-When 100,000 heavenly soldiers were annihilated with a single blow, all the players were devastated:
-"Who cares what this is called?"
-"We can't beat them, we simply can't beat them!"
-With her omniscience of Chinese mythology, Jiang Li becomes Bodhi's disciple at Fangcun Mountain, steals magical treasures in the Investiture of the Gods, and accumulates merits in Journey to the West.
-When Western players were furious and even wanted to join forces to gang up on China.
-Jiang Li stood tall amidst the clouds, with the phantom of Pangu opening the heavens behind her, Nuwa showing compassion, and the Three Pure Ones appearing solemnly.
-All the gods and Buddhas in the heavens cried out: "Who dares to bully my child? Die!"
-Of all the myths in the world, only China reigns supreme.
-If you're not happy, then fight! Fight until Ragnarok!
+Run git clone https://github.com/hanshu1202/andrew-tts-audio.git video-repo
+Cloning into 'video-repo'...
+Updating files:  87% (7/8)
+Updating files: 100% (8/8)
+Updating files: 100% (8/8), done.
+Checking for split video files...
+Merging parts for source_videos/1...
+cat: 'source_videos/1.part*': No such file or directory
+Error: Process completed with exit code 1.
