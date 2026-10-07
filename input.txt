@@ -1,3 +1,17 @@
+Andrew TTS
+by Cracked Player
+Paste a novel.
+Get an audiobook.
+Drop in the text, hit generate, and watch every chunk get voiced in parallel.
+
+⚡
+Fast Mode
+Max 20 workers · Full speed
+⚖️
+Balanced Mode
+Max 10 workers · Run 2 novels
+test last
+Novel name (optional)
 All features are now complete! Here's what I delivered:
 
 🎉 Summary of Everything Done:
@@ -24,3 +38,49 @@ All features are now complete! Here's what I delivered:
 3. Result: Your audiobook plays with subtitles automatically embedded in the video
 
 The entire system works end-to-end now. You're all set!
+Novel text
+Output format
+🎵
+Audio only
+🎬
+Video
+
+720p (HD)
+Video resolution
+Upload .txt
+1 KB / 10000 KB
+Generate video
+Failed
+Elapsed 2m 44s
+0%
+0/0 chunks (0%)
+Workers
+0/6
+Chunks done
+0
+Missing
+0
+Initialize
+success
+Worker (4)
+success
+Worker (5)
+success
+Worker (2)
+success
+Worker (3)
+success
+Worker (1)
+success
+Worker (6)
+success
+Merge Audio
+success
+Create Video
+failure
+Publish Release
+success
+Open run on GitHub
+Generate
+Library
+Failed to trigger workflow (422): Invalid Argument - failed to parse workflow: (Line: 422, Col: 9): 'run' is already defined
