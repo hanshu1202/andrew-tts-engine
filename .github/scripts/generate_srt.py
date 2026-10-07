@@ -11,7 +11,6 @@ CONCURRENCY = 8
 MAX_RETRIES = 3
 GAP_MS = 0
 AVG_MS_PER_WORD = 350
-YELLOW = "#FFFF00"
 
 def fmt_time(ms):
     ms = max(0, int(ms))
@@ -80,8 +79,6 @@ def slice_original_words(chunk_text, tts_sentences):
 
 async def main():
     t0 = time.time()
-    # Handle plain SRT for burn-in mode
-    srt_plain = os.environ.get("SRT_PLAIN") == "1"
 
     test_comm = edge_tts.Communicate("Hello world. This is a test.", VOICE)
     test_evts = [i async for i in test_comm.stream() if i.get("type") == "SentenceBoundary"]
@@ -89,12 +86,12 @@ async def main():
         print("  SentenceBoundary working")
     else:
         print("  ERROR: No SentenceBoundary events")
-        return
+        sys.exit(1)
 
     print("  Reading input text and chunks...")
     if not os.path.exists(INPUT_FILE):
         print(f"  ERROR: {INPUT_FILE} not found")
-        return
+        sys.exit(1)
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         full_text = f.read().strip()
 
@@ -104,7 +101,7 @@ async def main():
     chunks = []
     if not os.path.exists(OUTPUT_DIR):
         print(f"  ERROR: Directory {OUTPUT_DIR} not found")
-        return
+        sys.exit(1)
     for f in sorted(os.listdir(OUTPUT_DIR)):
         if f.startswith("chunk_") and f.endswith(".mp3"):
             idx = int(f.split("_")[1].split(".")[0])
@@ -116,7 +113,7 @@ async def main():
 
     if not chunks:
         print("  ERROR: No chunk files found")
-        return
+        sys.exit(1)
 
     total = len(chunks)
     semaphore = asyncio.Semaphore(CONCURRENCY)
@@ -146,8 +143,7 @@ async def main():
     results.sort(key=lambda x: x[0])
 
     chunks_by_idx = dict(chunks)
-    entries = []
-    entry_id = 1
+    raw_entries = []
     clock_ms = 0.0
     words_per_entry_max = WORDS_PER_LINE * LINES_PER_ENTRY
     for idx, evts, text in results:
@@ -179,18 +175,39 @@ async def main():
                 lines = []
                 for ln in range(0, len(group), WORDS_PER_LINE):
                     line_text = " ".join(group[ln: ln + WORDS_PER_LINE])
-                    line_text = line_text.replace("<", "&lt;").replace(">", "&gt;")
-                    if srt_plain:
-                        lines.append(line_text)
-                    else:
-                        lines.append(f'<font color="{YELLOW}">{line_text}</font>')
-                entries.append(
-                    f"{entry_id}\n{fmt_time(group_start)} --> {fmt_time(group_end)}\n"
-                    + "\n".join(lines) + "\n"
-                )
-                entry_id += 1
+                    lines.append(line_text)
+                text_block = "\n".join(lines).replace("\r", "")
+                raw_entries.append({
+                    "start": group_start,
+                    "end": group_end,
+                    "text": text_block
+                })
                 i += len(group)
         clock_ms += real_duration_ms + GAP_MS
+
+    def is_only_punct(t):
+        return re.sub(r'[\W_]+', '', t) == ""
+
+    filtered_entries = []
+    for cur in raw_entries:
+        if is_only_punct(cur["text"]):
+            continue
+        dur = cur["end"] - cur["start"]
+        if dur < 400 and filtered_entries:
+            filtered_entries[-1]["end"] = cur["end"]
+            filtered_entries[-1]["text"] += " " + cur["text"].replace("\n", " ")
+        else:
+            filtered_entries.append(cur)
+
+    if not filtered_entries:
+        print("  ERROR: No subtitle entries generated")
+        sys.exit(1)
+
+    entries = []
+    for i, cur in enumerate(filtered_entries):
+        entries.append(
+            f"{i+1}\n{fmt_time(cur['start'])} --> {fmt_time(cur['end'])}\n{cur['text']}\n"
+        )
 
     with open(OUTPUT_SRT, "w", encoding="utf-8") as f:
         f.write("\n".join(entries))

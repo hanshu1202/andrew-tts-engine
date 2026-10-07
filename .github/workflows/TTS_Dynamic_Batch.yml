@@ -40,14 +40,6 @@ on:
           - "360"
           - "240"
           - "144"
-      subtitle_mode:
-        description: "soft = fast, yellow via tags (player must support color); burn = baked into video (works everywhere, slower)"
-        required: false
-        default: "soft"
-        type: choice
-        options:
-          - soft
-          - burn
 
 jobs:
   init:
@@ -174,6 +166,7 @@ jobs:
     needs: [init, merge]
     if: github.event.inputs.output_type == 'video'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install ffmpeg
@@ -211,7 +204,7 @@ jobs:
           merge-multiple: true
           path: output_chunks
 
-      - name: Generate subtitles (parallel with video encoding)
+      - name: Generate subtitles
         run: |
           if [ -n "${{ github.event.inputs.text_input }}" ]; then
             echo "${{ github.event.inputs.text_input }}" > input.txt
@@ -220,10 +213,23 @@ jobs:
           mkdir -p srt
           python3 .github/scripts/generate_srt.py
 
-      - name: Embed subtitles into video (fast mux)
+      - name: Embed subtitles into MKV
         run: |
           mkdir -p output
-          ffmpeg -y -i output/final.mp4 -i srt/subtitles.srt -c copy -c:s mov_text output/subtitled.mp4
+          ffmpeg -y -i output/final.mp4 -i srt/subtitles.srt \
+            -map 0:v:0 -map 0:a:0 -map 1:0 \
+            -c copy -c:s srt \
+            -metadata:s:s:0 language=eng \
+            -disposition:s:0 default \
+            output/subtitled.mkv
+            
+          # Verify subtitle stream exists
+          ffprobe -v error -show_entries stream=index,codec_name,codec_type -of default=nw=1 output/subtitled.mkv > probe.log
+          cat probe.log
+          if ! grep -q "codec_name=subrip" probe.log; then
+            echo "❌ No SRT subtitle stream found in output"
+            exit 1
+          fi
 
       - name: Rename output
         run: |
@@ -232,8 +238,8 @@ jobs:
           NOVEL="${{ github.event.inputs.novel_name }}"
           if [ -z "$NOVEL" ]; then NOVEL="andrew-video"; fi
           CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
-          mv subtitled.mp4 "${CLEAN}_${TIMESTAMP}.mp4"
-          echo "OUTPUT_FILE=${CLEAN}_${TIMESTAMP}.mp4" >> $GITHUB_ENV
+          mv subtitled.mkv "${CLEAN}_${TIMESTAMP}.mkv"
+          echo "OUTPUT_FILE=${CLEAN}_${TIMESTAMP}.mkv" >> $GITHUB_ENV
 
       - name: Upload video artifact
         uses: actions/upload-artifact@v4
@@ -260,13 +266,23 @@ jobs:
           TAG="tts-$(date +'%Y%m%d-%H%M%S')"
           TITLE="TTS — ${{ github.event.inputs.novel_name }}"
           OUTPUT_TYPE="${{ github.event.inputs.output_type }}"
-          if [ "$OUTPUT_TYPE" = "video" ] && [ -d "final-video" ]; then
-            FILE=$(ls final-video/*.mp4 | head -n 1)
+          
+          if [ "$OUTPUT_TYPE" = "video" ]; then
+            FILE=$(ls final-video/*.mkv 2>/dev/null | head -n 1) || true
+            if [ -z "$FILE" ]; then
+              echo "❌ Final video artifact (.mkv) not found in final-video/"
+              exit 1
+            fi
             NOTES="🎬 Video generated in ${{ github.event.inputs.mode }} mode at ${{ github.event.inputs.resolution }}p"
           else
-            FILE=$(ls final-audio/*.mp3 | head -n 1)
+            FILE=$(ls final-audio/*.mp3 2>/dev/null | head -n 1) || true
+            if [ -z "$FILE" ]; then
+              echo "❌ Final audio artifact (.mp3) not found in final-audio/"
+              exit 1
+            fi
             NOTES="🎵 Audio generated in ${{ github.event.inputs.mode }} mode"
           fi
+          
           gh release create "$TAG" "$FILE" \
             --repo hanshu1202/andrew-tts-audio \
             -t "$TITLE" \
