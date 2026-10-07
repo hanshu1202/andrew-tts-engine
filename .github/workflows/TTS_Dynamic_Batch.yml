@@ -416,10 +416,7 @@ jobs:
 
       - name: Generate subtitles (parallel with video encoding)
         run: |
-          # Install edge-tts in the same environment as the subtitle script
           pip install edge-tts pydub -q
-          mkdir -p srt
-        run: |
           mkdir -p srt
           AUDIO_DURATION="${{ needs.merge.outputs.audio_duration }}"
           OUTPUT_DIR="chunks"
