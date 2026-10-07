@@ -274,9 +274,18 @@ jobs:
         run: |
           git clone https://github.com/hanshu1202/andrew-tts-audio.git video-repo
           cd video-repo
+
+          # Check for split files and merge them
+          echo "Checking for split video files..."
+          for f in $(ls source_videos/*.part* 2>/dev/null | cut -d. -f1 | uniq); do
+            echo "Merging parts for $f..."
+            cat "$f".part* > "${f%.*}.mp4"
+            echo "✅ Merged ${f%.*}.mp4"
+          done
+
           if [ ! -d "source_videos" ] || [ -z "$(ls -A source_videos 2>/dev/null)" ]; then
             echo "⚠️  No source videos found in andrew-tts-audio/source_videos"
-            echo "Please upload videos to that directory first"
+            echo "Please run the Setup workflow in the audio repo first"
             exit 1
           fi
           echo "✅ Found source videos:"
