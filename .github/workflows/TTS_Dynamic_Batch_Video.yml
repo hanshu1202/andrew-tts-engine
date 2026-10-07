@@ -224,7 +224,7 @@ jobs:
           NOVEL="${{ github.event.inputs.novel_name }}"
           if [ -z "$NOVEL" ]; then NOVEL="andrew-video"; fi
           CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
-          mv final.mp4 "${CLEAN}_${TIMESTAMP}.mp4"
+          mv subtitled.mp4 "${CLEAN}_${TIMESTAMP}.mp4"
           echo "OUTPUT_FILE=${CLEAN}_${TIMESTAMP}.mp4" >> $GITHUB_ENV
 
       - name: Upload video artifact
