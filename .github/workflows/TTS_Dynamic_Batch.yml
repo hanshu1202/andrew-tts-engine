@@ -268,27 +268,20 @@ jobs:
       - name: Install ffmpeg
         run: sudo apt-get install -y -q ffmpeg
 
-      - name: Clone video source repo
+      - name: Download source videos from Release
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          git clone https://github.com/hanshu1202/andrew-tts-audio.git video-repo
-          cd video-repo
+          mkdir -p source_videos
+          # Download all assets from the 'source-videos' release
+          gh release download source-videos --repo hanshu1202/andrew-tts-engine --dir source_videos
 
-          # Check for split files and merge them
-          echo "Checking for split video files..."
-          for f in $(ls source_videos/*.part* 2>/dev/null | sed 's/\.part[0-9]*$//' | uniq); do
-            echo "Merging parts for $f..."
-            cat "$f".part* > "${f}.mp4"
-            echo "✅ Merged ${f}.mp4"
-          done
-
-          if [ ! -d "source_videos" ] || [ -z "$(ls -A source_videos 2>/dev/null)" ]; then
-            echo "⚠️  No source videos found in andrew-tts-audio/source_videos"
-            echo "Please run the Setup workflow in the audio repo first"
+          if [ -z "$(ls -A source_videos 2>/dev/null)" ]; then
+            echo "⚠️  No source videos found in 'source-videos' release"
+            echo "Please create a release named 'source-videos' in the engine repo and upload your MP4s"
             exit 1
           fi
-          echo "✅ Found source videos:"
+          echo "✅ Downloaded source videos:"
           ls -lh source_videos/
 
       - name: Download audio
@@ -306,10 +299,14 @@ jobs:
 
           AUDIO_DURATION = float("${{ needs.merge.outputs.audio_duration }}")
           RESOLUTION = "${{ github.event.inputs.resolution }}"
-          AUDIO_FILE = "$(ls audio/*.mp3)"
+          audio_files = [os.path.join('audio', f) for f in os.listdir('audio') if f.endswith('.mp3')]
+          if not audio_files:
+              print("❌ No audio file found")
+              sys.exit(1)
+          AUDIO_FILE = audio_files[0]
 
           # Get all source videos
-          video_dir = "video-repo/source_videos"
+          video_dir = "source_videos"
           videos = [os.path.join(video_dir, f) for f in os.listdir(video_dir)
                    if f.lower().endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm'))]
 
@@ -380,17 +377,10 @@ jobs:
 
           # Merge video with audio
           print("🎵 Merging audio...")
-          # FIX: Get the actual file path instead of using $(ls ...) in a list
-          audio_files = [os.path.join('audio', f) for f in os.listdir('audio') if f.endswith('.mp3')]
-          if not audio_files:
-              print("❌ No audio file found in audio folder")
-              sys.exit(1)
-          audio_file = audio_files[0]
-
           subprocess.run([
               'ffmpeg', '-y',
               '-i', 'temp_video.mp4',
-              '-i', audio_file,
+              '-i', AUDIO_FILE,
               '-c:v', 'copy',
               '-c:a', 'aac',
               '-map', '0:v:0',
@@ -403,9 +393,9 @@ jobs:
           size_mb = os.path.getsize('output/final.mp4') / (1024 * 1024)
           print(f"\n📦 Video size: {size_mb:.1f} MB")
 
-          # Compress if > 4.5GB (leave room for zip overhead)
-          if size_mb > 4500:
-              print("⚠️  Size > 4.5GB, compressing...")
+          # Compress if > 1.8GB (leave room for zip overhead to stay under 2GB)
+          if size_mb > 1800:
+              print("⚠️  Size > 1.8GB, compressing...")
               subprocess.run([
                   'ffmpeg', '-y',
                   '-i', 'output/final.mp4',
