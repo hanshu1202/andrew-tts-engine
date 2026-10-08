@@ -203,15 +203,15 @@ jobs:
           mkdir -p srt
           python3 .github/scripts/generate_srt.py
 
-      - name: Embed subtitles into MKV
+      - name: Embed subtitles into MP4
         run: |
           mkdir -p output
-          ffmpeg -y -i output/final.mkv -i srt/subtitles.srt \
+          ffmpeg -y -i output/final.mp4 -i srt/subtitles.srt \
             -map 0:v:0 -map 0:a:0 -map 1:0 \
-            -c copy -c:s srt \
+            -c copy -c:s mov_text \
             -metadata:s:s:0 language=eng \
             -disposition:s:0 default \
-            output/subtitled.mkv
+            output/subtitled.mp4
 
           # Verify subtitle stream exists
           ffprobe -v error -show_entries stream=index,codec_name,codec_type -of default=nw=1 output/subtitled.mkv > probe.log
@@ -228,8 +228,8 @@ jobs:
           NOVEL="${{ github.event.inputs.novel_name }}"
           if [ -z "$NOVEL" ]; then NOVEL="andrew-video"; fi
           CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
-          mv subtitled.mkv "${CLEAN}_${TIMESTAMP}.mkv"
-          echo "OUTPUT_FILE=${CLEAN}_${TIMESTAMP}.mkv" >> $GITHUB_ENV
+          mv subtitled.mp4 "${CLEAN}_${TIMESTAMP}.mp4"
+          echo "OUTPUT_FILE=${CLEAN}_${TIMESTAMP}.mp4" >> $GITHUB_ENV
 
       - name: Upload video artifact
         uses: actions/upload-artifact@v4
@@ -258,9 +258,9 @@ jobs:
           OUTPUT_TYPE="${{ github.event.inputs.output_type }}"
 
           if [ "$OUTPUT_TYPE" = "video" ]; then
-            FILE=$(ls final-video/*.mkv 2>/dev/null | head -n 1) || true
+            FILE=$(ls final-video/*.mp4 2>/dev/null | head -n 1) || true
             if [ -z "$FILE" ]; then
-              echo "❌ Final video artifact (.mkv) not found in final-video/"
+              echo "❌ Final video artifact (.mp4) not found in final-video/"
               exit 1
             fi
             NOTES="🎬 Video generated in ${{ github.event.inputs.mode }} mode (original quality)"

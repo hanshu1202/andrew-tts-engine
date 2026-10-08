@@ -111,7 +111,7 @@ def main():
         '-c:a', 'copy',
         '-t', str(AUDIO_DURATION),
         '-avoid_negative_ts', 'make_zero',
-        'output/final.mkv'
+        'output/final.mp4'
     ]
 
     subprocess.run(merge_cmd, check=True)
