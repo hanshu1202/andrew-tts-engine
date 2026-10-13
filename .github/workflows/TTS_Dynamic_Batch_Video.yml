@@ -116,8 +116,10 @@ jobs:
       audio_duration: ${{ steps.merge.outputs.audio_duration }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install ffmpeg
-        run: sudo apt-get install -y -q ffmpeg
+      - name: Setup ffmpeg
+        run: |
+          chmod +x .github/bin/ffmpeg
+          echo "$(pwd)/.github/bin" >> $GITHUB_PATH
 
       - name: Download all chunks
         uses: actions/download-artifact@v4
@@ -160,8 +162,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: Install ffmpeg
-        run: sudo apt-get install -y -q ffmpeg
+      - name: Setup ffmpeg
+        run: |
+          chmod +x .github/bin/ffmpeg
+          echo "$(pwd)/.github/bin" >> $GITHUB_PATH
 
       - name: Download source videos from Release
         env:
