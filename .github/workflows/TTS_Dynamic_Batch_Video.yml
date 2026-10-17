@@ -12,21 +12,13 @@ on:
         required: false
         default: ""
       mode:
-        description: "Mode: fast (max 20 workers) or balanced (max 10 workers)"
+        description: "Mode: fast or balanced"
         required: false
         default: "fast"
-        type: choice
-        options:
-          - fast
-          - balanced
       output_type:
         description: "Output: audio or video"
         required: false
         default: "audio"
-        type: choice
-        options:
-          - audio
-          - video
 
 jobs:
   init:
@@ -65,14 +57,14 @@ jobs:
           MATRIX=$(seq -s, 1 $WORKERS | sed 's/^/[/; s/$/]/')
           echo "worker_matrix=$MATRIX" >> $GITHUB_OUTPUT
 
-          echo "📊 Total: $CHARS chars → $TOTAL chunks"
-          echo "🏃 Mode: $MODE → spawning $WORKERS workers (max: $MAX_WORKERS)"
-          echo "🎬 Output: ${{ github.event.inputs.output_type }}"
+          echo "Total: $CHARS chars → $TOTAL chunks"
+          echo "Mode: $MODE → spawning $WORKERS workers (max: $MAX_WORKERS)"
+          echo "Output: ${{ github.event.inputs.output_type }}"
 
           curl -sf -X POST "$SUPABASE_URL/rest/v1/rpc/reset_run" \
             -H "apikey: $SUPABASE_SECRET_KEY" -H "Content-Type: application/json" \
             -d "{\"p_total\": $TOTAL}"
-          echo "✅ Coordinator reset"
+          echo "Coordinator reset"
 
   process:
     name: Worker
@@ -156,7 +148,7 @@ __NOVEL__
           DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT")
           echo "audio_file=$OUTPUT" >> $GITHUB_OUTPUT
           echo "audio_duration=$DURATION" >> $GITHUB_OUTPUT
-          echo "✅ Merged into $OUTPUT (${DURATION}s)"
+          echo "Merged into $OUTPUT (${DURATION}s)"
 
       - name: Upload audio artifact
         uses: actions/upload-artifact@v4
@@ -167,7 +159,7 @@ __NOVEL__
   video-encode:
     name: Create Video
     needs: [init, merge]
-    if: github.event.inputs.output_type == 'video'
+    if: ${{ github.event.inputs.output_type == 'video' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -184,7 +176,7 @@ __NOVEL__
           mkdir -p source_videos
           gh release download source-videos --repo hanshu1202/andrew-tts-engine --dir source_videos
           if [ -z "$(ls -A source_videos 2>/dev/null)" ]; then
-            echo "⚠️  No source videos found"
+            echo "No source videos found"
             exit 1
           fi
 
@@ -230,7 +222,7 @@ __NOVEL__
           ffprobe -v error -show_entries stream=index,codec_name,codec_type -of default=nw=1 output/subtitled.mkv > probe.log
           cat probe.log
           if ! grep -q "codec_name=subrip" probe.log; then
-            echo "❌ No SRT subtitle stream found in output"
+            echo "No SRT subtitle stream found in output"
             exit 1
           fi
 
@@ -273,21 +265,21 @@ __NOVEL__
           if [ "$OUTPUT_TYPE" = "video" ]; then
             FILE=$(ls final-video/*.mkv 2>/dev/null | head -n 1) || true
             if [ -z "$FILE" ]; then
-              echo "❌ Final video artifact (.mkv) not found in final-video/"
+              echo "Final video artifact (.mkv) not found in final-video/"
               exit 1
             fi
-            NOTES="🎬 Video generated in ${{ github.event.inputs.mode }} mode (original quality)"
+            NOTES="Video generated in ${{ github.event.inputs.mode }} mode (original quality)"
           else
             FILE=$(ls final-audio/*.mp3 2>/dev/null | head -n 1) || true
             if [ -z "$FILE" ]; then
-              echo "❌ Final audio artifact (.mp3) not found in final-audio/"
+              echo "Final audio artifact (.mp3) not found in final-audio/"
               exit 1
             fi
-            NOTES="🎵 Audio generated in ${{ github.event.inputs.mode }} mode"
+            NOTES="Audio generated in ${{ github.event.inputs.mode }} mode"
           fi
 
           gh release create "$TAG" "$FILE" \
             --repo hanshu1202/andrew-tts-audio \
             -t "$TITLE" \
             -n "$NOTES"
-          echo "✅ Published to andrew-tts-audio"
+          echo "Published to andrew-tts-audio"
