@@ -137,11 +137,23 @@ jobs:
             echo "file '$PWD/$f'" >> ../filelist.txt
           done
           cd ..
-          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-          NOVEL="${{ github.event.inputs.novel_name }}"
+
+          # Safely read novel_name into a file (prevents execution of content)
+          cat > novel_raw.txt <<'__NOVEL__'
+${{ github.event.inputs.novel_name }}
+__NOVEL__
+
+          # collapse newlines to spaces and trim
+          NOVEL=$(tr '\n' ' ' < novel_raw.txt | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           if [ -z "$NOVEL" ]; then NOVEL="andrew-audio"; fi
-          CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
+
+          # Make a safe slug: replace non-alnum/- with underscore, collapse underscores
+          CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g' | sed 's/_\+/_/g' | sed 's/^_//; s/_$//')
+          if [ -z "$CLEAN" ]; then CLEAN="andrew_audio"; fi
+
+          TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
           OUTPUT="output/${CLEAN}_${TIMESTAMP}.mp3"
+
           ffmpeg -y -f concat -safe 0 -i filelist.txt -c copy "$OUTPUT"
           DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$OUTPUT")
           echo "audio_file=$OUTPUT" >> $GITHUB_OUTPUT
