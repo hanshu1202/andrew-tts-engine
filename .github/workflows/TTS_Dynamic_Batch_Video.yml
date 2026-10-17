@@ -138,16 +138,14 @@ jobs:
           done
           cd ..
 
-          # Safely read novel_name into a file (prevents execution of content)
+          # Safely read novel_name into a file
           cat > novel_raw.txt <<'__NOVEL__'
 ${{ github.event.inputs.novel_name }}
 __NOVEL__
 
-          # collapse newlines to spaces and trim
           NOVEL=$(tr '\n' ' ' < novel_raw.txt | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           if [ -z "$NOVEL" ]; then NOVEL="andrew-audio"; fi
 
-          # Make a safe slug: replace non-alnum/- with underscore, collapse underscores
           CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g' | sed 's/_\+/_/g' | sed 's/^_//; s/_$//')
           if [ -z "$CLEAN" ]; then CLEAN="andrew_audio"; fi
 
@@ -229,7 +227,6 @@ __NOVEL__
             -disposition:s:0 default \
             output/subtitled.mkv
 
-          # Verify subtitle stream exists
           ffprobe -v error -show_entries stream=index,codec_name,codec_type -of default=nw=1 output/subtitled.mkv > probe.log
           cat probe.log
           if ! grep -q "codec_name=subrip" probe.log; then
@@ -243,7 +240,7 @@ __NOVEL__
           TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
           NOVEL="${{ github.event.inputs.novel_name }}"
           if [ -z "$NOVEL" ]; then NOVEL="andrew-video"; fi
-          CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
+          CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g' | sed 's/_\+/_/g' | sed 's/^_//; s/_$//')
           mv subtitled.mkv "${CLEAN}_${TIMESTAMP}.mkv"
           echo "OUTPUT_FILE=${CLEAN}_${TIMESTAMP}.mkv" >> $GITHUB_ENV
 
