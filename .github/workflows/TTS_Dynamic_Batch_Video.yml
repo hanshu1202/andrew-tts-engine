@@ -130,6 +130,8 @@ jobs:
 
       - name: Merge chunks
         id: merge
+        env:
+          NOVEL_NAME: ${{ github.event.inputs.novel_name }}
         run: |
           mkdir -p output
           cd output_chunks
@@ -138,7 +140,7 @@ jobs:
           done
           cd ..
           TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-          NOVEL="${{ github.event.inputs.novel_name }}"
+          NOVEL=$(printf '%s' "$NOVEL_NAME" | tr '\n' ' ')
           if [ -z "$NOVEL" ]; then NOVEL="andrew-audio"; fi
           CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
           OUTPUT="output/${CLEAN}_${TIMESTAMP}.mp3"
@@ -226,10 +228,12 @@ jobs:
           fi
 
       - name: Rename output
+        env:
+          NOVEL_NAME: ${{ github.event.inputs.novel_name }}
         run: |
           cd output
           TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-          NOVEL="${{ github.event.inputs.novel_name }}"
+          NOVEL=$(printf '%s' "$NOVEL_NAME" | tr '\n' ' ')
           if [ -z "$NOVEL" ]; then NOVEL="andrew-video"; fi
           CLEAN=$(echo "$NOVEL" | sed 's/[^a-zA-Z0-9-]/_/g')
           mv subtitled.mkv "${CLEAN}_${TIMESTAMP}.mkv"
@@ -255,10 +259,12 @@ jobs:
       - name: Create Release
         env:
           GH_TOKEN: ${{ secrets.PAT }}
+          NOVEL_NAME: ${{ github.event.inputs.novel_name }}
         run: |
           cd artifacts
           TAG="tts-$(date +'%Y%m%d-%H%M%S')"
-          TITLE="TTS — ${{ github.event.inputs.novel_name }}"
+          NOVEL_TITLE=$(printf '%s' "$NOVEL_NAME" | tr '\n' ' ')
+          TITLE="TTS — $NOVEL_TITLE"
           OUTPUT_TYPE="${{ github.event.inputs.output_type }}"
 
           if [ "$OUTPUT_TYPE" = "video" ]; then
