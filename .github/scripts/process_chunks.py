@@ -1,4 +1,5 @@
-import os, sys, time, requests, subprocess, asyncio
+import os, sys, time, requests, subprocess, asyncio, json
+import edge_tts
 
 # Environment variables passed from GH Actions
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
@@ -52,9 +53,56 @@ def release_batch(chunks):
     for c in chunks:
         supabase_rpc("release_chunk", {"p_chunk": c})
 
+async def generate_with_timings(idx, chunk_text, out_path, json_path):
+    """New method: stream the speech, save the mp3 AND the sentence timings.
+    Returns True on success, False on any problem (caller then uses the old method)."""
+    tmp_path = out_path + ".tmp"
+    try:
+        sentences = []
+        communicate = edge_tts.Communicate(chunk_text, VOICE)
+        with open(tmp_path, "wb") as f:
+            async for item in communicate.stream():
+                kind = item.get("type")
+                if kind == "audio":
+                    f.write(item["data"])
+                elif kind == "SentenceBoundary":
+                    sentences.append({
+                        "offset_ms": item["offset"] // 10_000,
+                        "duration_ms": item["duration"] // 10_000,
+                        "tts_text": item.get("text", "").strip(),
+                    })
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+            raise RuntimeError("no audio received")
+        os.replace(tmp_path, out_path)
+    except Exception as e:
+        print(f"  ⚠️  Chunk {idx}: timing method failed ({e}), using fallback")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+    # Save timings. If this fails, the audio is still fine (subtitles will use the old method).
+    try:
+        if sentences:
+            tmp_json = json_path + ".tmp"
+            with open(tmp_json, "w", encoding="utf-8") as jf:
+                json.dump({"sentences": sentences}, jf)
+            os.replace(tmp_json, json_path)
+    except Exception as e:
+        print(f"  ⚠️  Chunk {idx}: could not save timings: {e}")
+    return True
+
 async def process_chunk(idx, chunk_text):
     out_path = f"chunks/chunk_{str(idx).zfill(5)}.mp3"
+    json_path = f"chunks/chunk_{str(idx).zfill(5)}.json"
     for attempt in range(3):
+        # Try the new method first (mp3 + sentence timings)
+        if await generate_with_timings(idx, chunk_text, out_path, json_path):
+            return idx
+
+        # Fallback: your original method (mp3 only)
         try:
             cmd = ["edge-tts", "--voice", VOICE, "--text", chunk_text, "--write-media", out_path]
             proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)

@@ -1,4 +1,4 @@
-import asyncio, os, time, sys, re
+import asyncio, os, time, sys, re, json
 import edge_tts
 
 VOICE = "en-US-AndrewMultilingualNeural"
@@ -25,6 +25,23 @@ def get_real_duration_ms(file_path):
     try:
         from pydub import AudioSegment
         return len(AudioSegment.from_file(file_path))
+    except Exception:
+        return None
+
+def load_saved_events(idx):
+    """Read the sentence timings saved by process_chunks.py. Returns None if missing/invalid."""
+    path = f"{OUTPUT_DIR}/chunk_{idx:05d}.json"
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        events = data.get("sentences", [])
+        if not events:
+            return None
+        for e in events:
+            _ = e["offset_ms"], e["duration_ms"], e["tts_text"]
+        return events
     except Exception:
         return None
 
@@ -119,12 +136,20 @@ async def main():
     semaphore = asyncio.Semaphore(CONCURRENCY)
     done = 0
     failed = 0
+    from_saved = 0
     results = []
 
     async def tracked(chunk, i):
-        nonlocal done, failed
+        nonlocal done, failed, from_saved
         idx, text = chunk
-        result = await collect_sentence_events(text, semaphore, idx)
+        saved = load_saved_events(idx)
+        if saved is not None:
+            # Fast path: timings were saved while the audio was generated
+            result = (idx, saved, text)
+            from_saved += 1
+        else:
+            # Fallback: old method (asks edge-tts again)
+            result = await collect_sentence_events(text, semaphore, idx)
         done += 1
         if not result[1]:
             failed += 1
@@ -140,6 +165,7 @@ async def main():
     tasks = [tracked(chunk, i) for i, chunk in enumerate(chunks)]
     await asyncio.gather(*tasks)
     print()
+    print(f"  Timings: {from_saved} chunks from saved files, {total - from_saved} regenerated")
     results.sort(key=lambda x: x[0])
 
     chunks_by_idx = dict(chunks)

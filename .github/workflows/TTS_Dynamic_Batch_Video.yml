@@ -104,7 +104,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chunks-worker-${{ matrix.worker_id }}
-          path: chunks/*.mp3
+          path: |
+            chunks/*.mp3
+            chunks/*.json
           retention-days: 1
 
   merge:
