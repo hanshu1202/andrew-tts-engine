@@ -1,0 +1,2 @@
+This file was created by the github-change-pr skill as a harmless test.
+It is safe to delete.
